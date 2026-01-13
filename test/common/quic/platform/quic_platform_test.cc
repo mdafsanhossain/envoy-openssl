@@ -23,8 +23,8 @@
 #include "fmt/printf.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "quiche/common/platform/api/quiche_mem_slice.h"
 #include "quiche/common/platform/api/quiche_system_event_loop.h"
+#include "quiche/common/quiche_mem_slice.h"
 #include "quiche/common/quiche_mem_slice_storage.h"
 #include "quiche/quic/platform/api/quic_bug_tracker.h"
 #include "quiche/quic/platform/api/quic_client_stats.h"
@@ -98,12 +98,12 @@ TEST_F(QuicPlatformTest, QuicClientStats) {
   QUIC_CLIENT_HISTOGRAM_ENUM("my.enum.histogram", TestEnum::ONE, TestEnum::COUNT, "doc");
   QUIC_CLIENT_HISTOGRAM_BOOL("my.bool.histogram", false, "doc");
   QUIC_CLIENT_HISTOGRAM_TIMES("my.timing.histogram", QuicTime::Delta::FromSeconds(5),
-                              QuicTime::Delta::FromSeconds(1), QuicTime::Delta::FromSecond(3600),
+                              QuicTime::Delta::FromSeconds(1), QuicTime::Delta::FromSeconds(3600),
                               100, "doc");
   QUIC_CLIENT_HISTOGRAM_COUNTS("my.count.histogram", 123, 0, 1000, 100, "doc");
   QuicClientSparseHistogram("my.sparse.histogram", 345);
   // Make sure compiler doesn't report unused-parameter error.
-  bool should_be_used;
+  bool should_be_used = false;
   QUIC_CLIENT_HISTOGRAM_BOOL("my.bool.histogram", should_be_used, "doc");
 }
 
@@ -121,7 +121,7 @@ TEST_F(QuicPlatformTest, QuicExportedStats) {
   QUIC_HISTOGRAM_ENUM("my.enum.histogram", TestEnum::ONE, TestEnum::COUNT, "doc");
   QUIC_HISTOGRAM_BOOL("my.bool.histogram", false, "doc");
   QUIC_HISTOGRAM_TIMES("my.timing.histogram", QuicTime::Delta::FromSeconds(5),
-                       QuicTime::Delta::FromSeconds(1), QuicTime::Delta::FromSecond(3600), 100,
+                       QuicTime::Delta::FromSeconds(1), QuicTime::Delta::FromSeconds(3600), 100,
                        "doc");
   QUIC_HISTOGRAM_COUNTS("my.count.histogram", 123, 0, 1000, 100, "doc");
 }
@@ -141,7 +141,7 @@ TEST_F(QuicPlatformTest, QuicServerStats) {
   QUIC_SERVER_HISTOGRAM_ENUM("my.enum.histogram", TestEnum::ONE, TestEnum::COUNT, "doc");
   QUIC_SERVER_HISTOGRAM_BOOL("my.bool.histogram", false, "doc");
   QUIC_SERVER_HISTOGRAM_TIMES("my.timing.histogram", QuicTime::Delta::FromSeconds(5),
-                              QuicTime::Delta::FromSeconds(1), QuicTime::Delta::FromSecond(3600),
+                              QuicTime::Delta::FromSeconds(1), QuicTime::Delta::FromSeconds(3600),
                               100, "doc");
   QUIC_SERVER_HISTOGRAM_COUNTS("my.count.histogram", 123, 0, 1000, 100, "doc");
 }
@@ -314,18 +314,21 @@ TEST_F(QuicPlatformTest, QuicheCheck) {
   QUICHE_CHECK(1 == 1);
   QUICHE_CHECK(1 == 1) << " 1 == 1 is forever true.";
 
-  EXPECT_DEBUG_DEATH({ QUICHE_DCHECK(false) << " Supposed to fail in debug mode."; },
-                     "Check failed:.* Supposed to fail in debug mode.");
+  EXPECT_DEBUG_DEATH(
+      { QUICHE_DCHECK(false) << " Supposed to fail in debug mode."; },
+      "Check failed:.* Supposed to fail in debug mode.");
   EXPECT_DEBUG_DEATH({ QUICHE_DCHECK(false); }, "Check failed");
 
-  EXPECT_DEATH({ QUICHE_CHECK(false) << " Supposed to fail in all modes."; },
-               "Check failed:.* Supposed to fail in all modes.");
+  EXPECT_DEATH(
+      { QUICHE_CHECK(false) << " Supposed to fail in all modes."; },
+      "Check failed:.* Supposed to fail in all modes.");
   EXPECT_DEATH({ QUICHE_CHECK(false); }, "Check failed");
   EXPECT_DEATH({ QUICHE_CHECK_LT(1 + 1, 2); }, "Check failed: 1 \\+ 1 \\(=2\\) < 2 \\(=2\\)");
-  EXPECT_DEBUG_DEATH({ QUICHE_DCHECK_NE(1 + 1, 2); },
-                     "Check failed: 1 \\+ 1 \\(=2\\) != 2 \\(=2\\)");
-  EXPECT_DEBUG_DEATH({ QUICHE_DCHECK_NE(nullptr, nullptr); },
-                     "Check failed: nullptr \\(=\\(null\\)\\) != nullptr \\(=\\(null\\)\\)");
+  EXPECT_DEBUG_DEATH(
+      { QUICHE_DCHECK_NE(1 + 1, 2); }, "Check failed: 1 \\+ 1 \\(=2\\) != 2 \\(=2\\)");
+  EXPECT_DEBUG_DEATH(
+      { QUICHE_DCHECK_NE(nullptr, nullptr); },
+      "Check failed: nullptr \\(=\\(null\\)\\) != nullptr \\(=\\(null\\)\\)");
 }
 
 // Test the behaviors of the cross products of

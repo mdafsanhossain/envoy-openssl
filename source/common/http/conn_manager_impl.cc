@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <list>
 #include <memory>
 #include <string>
@@ -79,6 +80,21 @@ bool requestWasConnect(const RequestHeaderMapSharedPtr& headers, Protocol protoc
   }
   // All HTTP/2 style upgrades were originally connect requests.
   return HeaderUtility::isConnect(*headers) || Utility::isUpgrade(*headers);
+}
+
+const Formatter::Formatter*
+operationNameFormatter(const Http::TracingConnectionManagerConfig& hcm_config,
+                       const Router::RouteTracing* route_config) {
+  const Formatter::Formatter* formatter =
+      route_config != nullptr ? route_config->operation().ptr() : nullptr;
+  return formatter != nullptr ? formatter : hcm_config.operation_.get();
+}
+const Formatter::Formatter*
+upstreamOperationNameFormatter(const Http::TracingConnectionManagerConfig& hcm_config,
+                               const Router::RouteTracing* route_config) {
+  const Formatter::Formatter* formatter =
+      route_config != nullptr ? route_config->upstreamOperation().ptr() : nullptr;
+  return formatter != nullptr ? formatter : hcm_config.upstream_operation_.get();
 }
 
 ConnectionManagerStats ConnectionManagerImpl::generateStats(const std::string& prefix,
@@ -270,8 +286,16 @@ void ConnectionManagerImpl::doEndStream(ActiveStream& stream, bool check_for_def
              StreamInfo::CoreResponseFlag::UpstreamConnectionTermination))) {
       stream.response_encoder_->getStream().resetStream(StreamResetReason::ConnectError);
     } else {
+      const bool reset_with_error =
+          Runtime::runtimeFeatureEnabled("envoy.reloadable_features.reset_with_error");
+      // TODO(wbpcode): We may should not propagate UpstreamProtocolError to downstream as that
+      // indicates an error on the upstream connection and may have nothing to do with the
+      // downstream.
       if (stream.filter_manager_.streamInfo().hasResponseFlag(
               StreamInfo::CoreResponseFlag::UpstreamProtocolError)) {
+        stream.response_encoder_->getStream().resetStream(StreamResetReason::ProtocolError);
+      } else if (reset_with_error && stream.filter_manager_.streamInfo().hasResponseFlag(
+                                         StreamInfo::CoreResponseFlag::DownstreamProtocolError)) {
         stream.response_encoder_->getStream().resetStream(StreamResetReason::ProtocolError);
       } else {
         stream.response_encoder_->getStream().resetStream(StreamResetReason::LocalReset);
@@ -431,7 +455,12 @@ RequestDecoder& ConnectionManagerImpl::newStream(ResponseEncoder& response_encod
   new_stream->response_encoder_ = &response_encoder;
   new_stream->response_encoder_->getStream().addCallbacks(*new_stream);
   new_stream->response_encoder_->getStream().registerCodecEventCallbacks(new_stream.get());
-  new_stream->response_encoder_->getStream().setFlushTimeout(new_stream->idle_timeout_ms_);
+  if (config_->streamFlushTimeout().has_value()) {
+    new_stream->response_encoder_->getStream().setFlushTimeout(
+        config_->streamFlushTimeout().value());
+  } else {
+    new_stream->response_encoder_->getStream().setFlushTimeout(config_->streamIdleTimeout());
+  }
   new_stream->streamInfo().setDownstreamBytesMeter(response_encoder.getStream().bytesMeter());
   // If the network connection is backed up, the stream should be made aware of it on creation.
   // Both HTTP/1.x and HTTP/2 codecs handle this in StreamCallbackHelper::addCallbacksHelper.
@@ -510,9 +539,6 @@ Network::FilterStatus ConnectionManagerImpl::onData(Buffer::Instance& data, bool
       handleCodecError(status.message());
       return Network::FilterStatus::StopIteration;
     } else if (isEnvoyOverloadError(status)) {
-      // The other codecs aren't wired to send this status.
-      ASSERT(codec_->protocol() < Protocol::Http2,
-             "Expected only HTTP1.1 and below to send overload error.");
       stats_.named_.downstream_rq_overload_close_.inc();
       handleCodecOverloadError(status.message());
       return Network::FilterStatus::StopIteration;
@@ -684,6 +710,23 @@ bool ConnectionManagerImpl::isPrematureRstStream(const ActiveStream& stream) con
 // Sends a GOAWAY if too many streams have been reset prematurely on this
 // connection.
 void ConnectionManagerImpl::maybeDrainDueToPrematureResets() {
+  // If the connection has been drained due to premature resets, do not check this again.
+  // Without this flag, recursion may occur, as shown in the following stack trace:
+  //
+  //   maybeDrainDueToPrematureResets()
+  //   doConnectionClose()
+  //   resetAllStreams()
+  //   onResetStream()
+  //   doDeferredStreamDestroy()
+  //   maybeDrainDueToPrematureResets()
+  //   ...
+  //
+  // The recursion will continue until all streams are destroyed. If there are many streams
+  // that may result in a stack overflow. This flag is used to avoid above recursion.
+  if (drained_due_to_premature_resets_) {
+    return;
+  }
+
   if (closed_non_internally_destroyed_requests_ == 0) {
     return;
   }
@@ -706,6 +749,10 @@ void ConnectionManagerImpl::maybeDrainDueToPrematureResets() {
 
   if (read_callbacks_->connection().state() == Network::Connection::State::Open) {
     stats_.named_.downstream_rq_too_many_premature_resets_.inc();
+
+    // Mark the the connection has been drained due to too many premature resets.
+    drained_due_to_premature_resets_ = true;
+
     doConnectionClose(Network::ConnectionCloseType::Abort, absl::nullopt,
                       "too_many_premature_resets");
   }
@@ -757,16 +804,33 @@ void ConnectionManagerImpl::onDrainTimeout() {
   checkForDeferredClose(false);
 }
 
-void ConnectionManagerImpl::sendGoAwayAndClose() {
+void ConnectionManagerImpl::sendGoAwayAndClose(bool graceful) {
   ENVOY_CONN_LOG(trace, "connection manager sendGoAwayAndClose was triggerred from filters.",
                  read_callbacks_->connection());
   if (go_away_sent_) {
     return;
   }
-  codec_->goAway();
-  go_away_sent_ = true;
-  doConnectionClose(Network::ConnectionCloseType::FlushWriteAndDelay, absl::nullopt,
-                    "forced_goaway");
+
+  // Use graceful drain sequence if graceful shutdown is requested.
+  // startDrainSequence() works for both HTTP/1 and HTTP/2:
+  // - HTTP/1: shutdownNotice() + goAway() provides graceful close
+  // - HTTP/2: shutdownNotice() sends GOAWAY with high stream ID, then goAway() sends final GOAWAY
+  if (graceful) {
+    if (drain_state_ == DrainState::NotDraining) {
+      startDrainSequence();
+    }
+    // Consider the "go away" process started once draining begins.
+    // The actual GOAWAY frame will be sent in onDrainTimeout(), but we want to
+    // prevent multiple calls to sendGoAwayAndClose() from starting multiple drain sequences.
+    go_away_sent_ = true;
+  } else {
+    // Immediate close - send GOAWAY and close immediately
+    codec_->shutdownNotice();
+    codec_->goAway();
+    go_away_sent_ = true;
+    doConnectionClose(Network::ConnectionCloseType::FlushWriteAndDelay, absl::nullopt,
+                      "forced_goaway");
+  }
 }
 
 void ConnectionManagerImpl::chargeTracingStats(const Tracing::Reason& tracing_reason,
@@ -828,8 +892,12 @@ ConnectionManagerImpl::ActiveStream::ActiveStream(ConnectionManagerImpl& connect
                       connection_manager_.overload_manager_),
       request_response_timespan_(new Stats::HistogramCompletableTimespanImpl(
           connection_manager_.stats_.named_.downstream_rq_time_, connection_manager_.timeSource())),
+      has_explicit_global_flush_timeout_(
+          connection_manager.config_->streamFlushTimeout().has_value()),
       header_validator_(
-          connection_manager.config_->makeHeaderValidator(connection_manager.codec_->protocol())) {
+          connection_manager.config_->makeHeaderValidator(connection_manager.codec_->protocol())),
+      trace_refresh_after_route_refresh_(Runtime::runtimeFeatureEnabled(
+          "envoy.reloadable_features.trace_refresh_after_route_refresh")) {
   ASSERT(!connection_manager.config_->isRoutable() ||
              ((connection_manager.config_->routeConfigProvider() == nullptr &&
                connection_manager.config_->scopedRouteConfigProvider() != nullptr &&
@@ -929,25 +997,14 @@ ConnectionManagerImpl::ActiveStream::ActiveStream(ConnectionManagerImpl& connect
 }
 
 void ConnectionManagerImpl::ActiveStream::log(AccessLog::AccessLogType type) {
-  const Formatter::HttpFormatterContext log_context{
+  const Formatter::Context log_context{
       request_headers_.get(), response_headers_.get(), response_trailers_.get(), {}, type,
       active_span_.get()};
 
-  const bool filter_access_loggers_first =
-      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.filter_access_loggers_first");
-
-  if (!filter_access_loggers_first) {
-    for (const auto& access_logger : connection_manager_.config_->accessLogs()) {
-      access_logger->log(log_context, filter_manager_.streamInfo());
-    }
-  }
-
   filter_manager_.log(log_context);
 
-  if (filter_access_loggers_first) {
-    for (const auto& access_logger : connection_manager_.config_->accessLogs()) {
-      access_logger->log(log_context, filter_manager_.streamInfo());
-    }
+  for (const auto& access_logger : connection_manager_.config_->accessLogs()) {
+    access_logger->log(log_context, filter_manager_.streamInfo());
   }
 }
 
@@ -1014,10 +1071,17 @@ void ConnectionManagerImpl::ActiveStream::onStreamMaxDurationReached() {
 }
 
 void ConnectionManagerImpl::ActiveStream::chargeStats(const ResponseHeaderMap& headers) {
+  if (trace_refresh_after_route_refresh_ && connection_manager_tracing_config_.has_value()) {
+    const Tracing::Decision tracing_decision =
+        Tracing::TracerUtility::shouldTraceRequest(filter_manager_.streamInfo());
+    ConnectionManagerImpl::chargeTracingStats(tracing_decision.reason,
+                                              connection_manager_.config_->tracingStats());
+  }
+
   uint64_t response_code = Utility::getResponseStatus(headers);
   filter_manager_.streamInfo().setResponseCode(response_code);
 
-  if (filter_manager_.streamInfo().health_check_request_) {
+  if (filter_manager_.streamInfo().healthCheck()) {
     return;
   }
 
@@ -1072,6 +1136,74 @@ bool streamErrorOnlyErrors(absl::string_view error_details) {
 }
 } // namespace
 
+void ConnectionManagerImpl::ActiveStream::setRequestDecorator(RequestHeaderMap& headers) {
+  ASSERT(active_span_ != nullptr);
+  const Router::Decorator* decorater = route_decorator_;
+
+  // If a decorator has been defined, apply it to the active span.
+  absl::string_view decorated_operation;
+  if (decorater != nullptr) {
+    decorated_operation = decorater->getOperation();
+
+    decorater->apply(*active_span_);
+    state_.decorated_propagate_ = decorater->propagate();
+  }
+
+  if (connection_manager_tracing_config_->operation_name_ == Tracing::OperationName::Egress) {
+    // For egress (outbound) requests, pass the decorator's operation name (if defined and
+    // propagation enabled) as a request header to enable the receiving service to use it in its
+    // server span.
+    if (!decorated_operation.empty() && state_.decorated_propagate_) {
+      headers.setEnvoyDecoratorOperation(decorated_operation);
+    }
+  } else {
+    absl::string_view req_operation_override = headers.getEnvoyDecoratorOperationValue();
+
+    // For ingress (inbound) requests, if a decorator operation name has been provided, it
+    // should be used to override the active span's operation.
+    if (!req_operation_override.empty()) {
+      active_span_->setOperation(req_operation_override);
+
+      // Set the decorator operation as overridden to avoid propagating the route decorator
+      // operation to the client when the setResponseDecorator() is called.
+      state_.decorator_overriden_ = true;
+    }
+    // Remove header so not propagated to service
+    headers.removeEnvoyDecoratorOperation();
+  }
+}
+
+void ConnectionManagerImpl::ActiveStream::setResponseDecorator(ResponseHeaderMap& headers) {
+  ASSERT(active_span_ != nullptr);
+
+  if (connection_manager_tracing_config_->operation_name_ == Tracing::OperationName::Ingress) {
+    // For ingress (inbound) responses, if the request headers do not include a
+    // decorator operation (override), and the decorated operation should be
+    // propagated, then pass the decorator's operation name (if defined)
+    // as a response header to enable the client service to use it in its client span.
+    if (state_.decorated_propagate_ && !state_.decorator_overriden_) {
+      absl::string_view decorated_operation =
+          route_decorator_ != nullptr ? route_decorator_->getOperation() : absl::string_view();
+
+      if (!decorated_operation.empty()) {
+        // If the decorator operation is defined, set it as the response header.
+        headers.setEnvoyDecoratorOperation(decorated_operation);
+      }
+    }
+  } else if (connection_manager_tracing_config_->operation_name_ ==
+             Tracing::OperationName::Egress) {
+    const absl::string_view resp_operation_override = headers.getEnvoyDecoratorOperationValue();
+
+    // For Egress (outbound) response, if a decorator operation name has been provided, it
+    // should be used to override the active span's operation.
+    if (!resp_operation_override.empty()) {
+      active_span_->setOperation(resp_operation_override);
+    }
+    // Remove header so not propagated to service.
+    headers.removeEnvoyDecoratorOperation();
+  }
+}
+
 bool ConnectionManagerImpl::ActiveStream::validateHeaders() {
   if (header_validator_) {
     auto validation_result = header_validator_->validateRequestHeaders(*request_headers_);
@@ -1106,6 +1238,9 @@ bool ConnectionManagerImpl::ActiveStream::validateHeaders() {
       } else if (is_grpc) {
         grpc_status = Grpc::Status::WellKnownGrpcStatus::Internal;
       }
+
+      filter_manager_.streamInfo().setResponseFlag(
+          StreamInfo::CoreResponseFlag::DownstreamProtocolError);
 
       // H/2 codec was resetting requests that were rejected due to headers with underscores,
       // instead of sending 400. Preserving this behavior for now.
@@ -1148,6 +1283,9 @@ bool ConnectionManagerImpl::ActiveStream::validateTrailers(RequestTrailerMap& tr
   if (Grpc::Common::hasGrpcContentType(*request_headers_)) {
     grpc_status = Grpc::Status::WellKnownGrpcStatus::Internal;
   }
+
+  filter_manager_.streamInfo().setResponseFlag(
+      StreamInfo::CoreResponseFlag::DownstreamProtocolError);
 
   // H/2 codec was resetting requests that were rejected due to headers with underscores,
   // instead of sending 400. Preserving this behavior for now.
@@ -1447,10 +1585,15 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(RequestHeaderMapSharedPt
 }
 
 void ConnectionManagerImpl::ActiveStream::traceRequest() {
+  ASSERT(connection_manager_tracing_config_.has_value());
+
   const Tracing::Decision tracing_decision =
       Tracing::TracerUtility::shouldTraceRequest(filter_manager_.streamInfo());
-  ConnectionManagerImpl::chargeTracingStats(tracing_decision.reason,
-                                            connection_manager_.config_->tracingStats());
+
+  if (!trace_refresh_after_route_refresh_) {
+    ConnectionManagerImpl::chargeTracingStats(tracing_decision.reason,
+                                              connection_manager_.config_->tracingStats());
+  }
 
   Tracing::HttpTraceContext trace_context(*request_headers_);
   active_span_ = connection_manager_.tracer().startSpan(
@@ -1459,47 +1602,14 @@ void ConnectionManagerImpl::ActiveStream::traceRequest() {
   if (!active_span_) {
     return;
   }
-
-  // TODO: Need to investigate the following code based on the cached route, as may
-  // be broken in the case a filter changes the route.
-
-  // If a decorator has been defined, apply it to the active span.
-  if (hasCachedRoute() && cached_route_.value()->decorator()) {
-    const Router::Decorator* decorator = cached_route_.value()->decorator();
-
-    decorator->apply(*active_span_);
-
-    state_.decorated_propagate_ = decorator->propagate();
-
-    // Cache decorated operation.
-    if (!decorator->getOperation().empty()) {
-      decorated_operation_ = &decorator->getOperation();
-    }
+  if (hasCachedRoute()) {
+    route_decorator_ = cached_route_.value()->decorator();
+    route_tracing_ = cached_route_.value()->tracingConfig();
   }
-
-  if (connection_manager_tracing_config_->operation_name_ == Tracing::OperationName::Egress) {
-    // For egress (outbound) requests, pass the decorator's operation name (if defined and
-    // propagation enabled) as a request header to enable the receiving service to use it in its
-    // server span.
-    if (decorated_operation_ && state_.decorated_propagate_) {
-      request_headers_->setEnvoyDecoratorOperation(*decorated_operation_);
-    }
-  } else {
-    const HeaderEntry* req_operation_override = request_headers_->EnvoyDecoratorOperation();
-
-    // For ingress (inbound) requests, if a decorator operation name has been provided, it
-    // should be used to override the active span's operation.
-    if (req_operation_override) {
-      if (!req_operation_override->value().empty()) {
-        active_span_->setOperation(req_operation_override->value().getStringView());
-
-        // Clear the decorated operation so won't be used in the response header, as
-        // it has been overridden by the inbound decorator operation request header.
-        decorated_operation_ = nullptr;
-      }
-      // Remove header so not propagated to service
-      request_headers_->removeEnvoyDecoratorOperation();
-    }
+  if (!operationNameFormatter(*connection_manager_tracing_config_, route_tracing_)) {
+    // Only set decorator when there is no operation name formatter configured at either
+    // the HCM level or the route level.
+    setRequestDecorator(*request_headers_);
   }
 }
 
@@ -1588,12 +1698,13 @@ void ConnectionManagerImpl::ActiveStream::snapScopedRouteConfig() {
 void ConnectionManagerImpl::ActiveStream::refreshCachedRoute() { refreshCachedRoute(nullptr); }
 
 void ConnectionManagerImpl::ActiveStream::refreshDurationTimeout() {
-  if (!filter_manager_.streamInfo().route() ||
-      !filter_manager_.streamInfo().route()->routeEntry() || !request_headers_) {
+  if (!hasCachedRoute() || !request_headers_) {
     return;
   }
-  const auto& route = filter_manager_.streamInfo().route()->routeEntry();
-
+  const Router::RouteEntry* route = cached_route_.value()->routeEntry();
+  if (route == nullptr) {
+    return;
+  }
   auto grpc_timeout = Grpc::Common::getGrpcTimeout(*request_headers_);
   std::chrono::milliseconds timeout;
   bool disable_timer = false;
@@ -1657,7 +1768,7 @@ void ConnectionManagerImpl::ActiveStream::refreshDurationTimeout() {
 
   // See how long this stream has been alive, and adjust the timeout
   // accordingly.
-  std::chrono::duration time_used = std::chrono::duration_cast<std::chrono::milliseconds>(
+  std::chrono::milliseconds time_used = std::chrono::duration_cast<std::chrono::milliseconds>(
       connection_manager_.timeSource().monotonicTime() -
       filter_manager_.streamInfo().startTimeMonotonic());
   if (timeout > time_used) {
@@ -1681,7 +1792,7 @@ void ConnectionManagerImpl::ActiveStream::refreshCachedRoute(const Router::Route
     return;
   }
 
-  Router::RouteConstSharedPtr route;
+  Router::VirtualHostRoute route_result;
   if (request_headers_ != nullptr) {
     if (connection_manager_.config_->isRoutable() &&
         connection_manager_.config_->scopedRouteConfigProvider() != nullptr &&
@@ -1690,34 +1801,47 @@ void ConnectionManagerImpl::ActiveStream::refreshCachedRoute(const Router::Route
       snapScopedRouteConfig();
     }
     if (snapped_route_config_ != nullptr) {
-      route = snapped_route_config_->route(cb, *request_headers_, filter_manager_.streamInfo(),
-                                           stream_id_);
+      route_result = snapped_route_config_->route(cb, *request_headers_,
+                                                  filter_manager_.streamInfo(), stream_id_);
     }
   }
 
-  setRoute(route);
+  setVirtualHostRoute(std::move(route_result));
 }
 
-void ConnectionManagerImpl::ActiveStream::refreshCachedTracingCustomTags() {
-  if (!connection_manager_tracing_config_.has_value()) {
+void ConnectionManagerImpl::ActiveStream::refreshTracing() {
+  if (!trace_refresh_after_route_refresh_) {
     return;
   }
-  const Tracing::CustomTagMap& conn_manager_tags = connection_manager_tracing_config_->custom_tags_;
-  const Tracing::CustomTagMap* route_tags = nullptr;
-  if (hasCachedRoute() && cached_route_.value()->tracingConfig()) {
-    route_tags = &cached_route_.value()->tracingConfig()->getCustomTags();
-  }
-  const bool configured_in_conn = !conn_manager_tags.empty();
-  const bool configured_in_route = route_tags && !route_tags->empty();
-  if (!configured_in_conn && !configured_in_route) {
+
+  if (!connection_manager_tracing_config_.has_value() || active_span_ == nullptr ||
+      request_headers_ == nullptr) {
     return;
   }
-  Tracing::CustomTagMap& custom_tag_map = getOrMakeTracingCustomTagMap();
-  if (configured_in_route) {
-    custom_tag_map.insert(route_tags->begin(), route_tags->end());
+
+  ASSERT(cached_route_.has_value());
+
+  // NOTE: if the trace reason have been encoded into the request id then the trace reason may
+  // not be updated. That means we may cannot to force a traced request to be untraced by the
+  // refreshing.
+  const auto trace_reason = ConnectionManagerUtility::mutateTracingRequestHeader(
+      *request_headers_, connection_manager_.runtime_, *connection_manager_.config_,
+      cached_route_.value().get());
+  filter_manager_.streamInfo().setTraceReason(trace_reason);
+  const Tracing::Decision tracing_decision =
+      Tracing::TracerUtility::shouldTraceRequest(filter_manager_.streamInfo());
+  if (active_span_->useLocalDecision()) {
+    active_span_->setSampled(tracing_decision.traced);
   }
-  if (configured_in_conn) {
-    custom_tag_map.insert(conn_manager_tags.begin(), conn_manager_tags.end());
+
+  if (hasCachedRoute()) {
+    route_decorator_ = cached_route_.value()->decorator();
+    route_tracing_ = cached_route_.value()->tracingConfig();
+  }
+  if (!operationNameFormatter(*connection_manager_tracing_config_, route_tracing_)) {
+    // Only set decorator when there is no operation name formatter configured at either
+    // the HCM level or the route level.
+    setRequestDecorator(*request_headers_);
   }
 }
 
@@ -1837,7 +1961,13 @@ void ConnectionManagerImpl::ActiveStream::encodeHeaders(ResponseHeaderMap& heade
   if (connection_manager_.drain_state_ == DrainState::NotDraining &&
       filter_manager_.streamInfo().shouldDrainConnectionUponCompletion()) {
     ENVOY_STREAM_LOG(debug, "closing connection due to connection close header", *this);
-    connection_manager_.drain_state_ = DrainState::Closing;
+    // For HTTP/2 and HTTP/3, send GOAWAY and allow current stream to complete.
+    // For HTTP/1.1, go directly to Closing (Connection: close header will be added below).
+    if (connection_manager_.codec_->protocol() >= Protocol::Http2) {
+      connection_manager_.startDrainSequence();
+    } else {
+      connection_manager_.drain_state_ = DrainState::Closing;
+    }
   }
 
   // If we are destroying a stream before remote is complete and the connection does not support
@@ -1870,28 +2000,12 @@ void ConnectionManagerImpl::ActiveStream::encodeHeaders(ResponseHeaderMap& heade
     }
   }
 
-  if (connection_manager_tracing_config_.has_value()) {
-    if (connection_manager_tracing_config_->operation_name_ == Tracing::OperationName::Ingress) {
-      // For ingress (inbound) responses, if the request headers do not include a
-      // decorator operation (override), and the decorated operation should be
-      // propagated, then pass the decorator's operation name (if defined)
-      // as a response header to enable the client service to use it in its client span.
-      if (decorated_operation_ && state_.decorated_propagate_) {
-        headers.setEnvoyDecoratorOperation(*decorated_operation_);
-      }
-    } else if (connection_manager_tracing_config_->operation_name_ ==
-               Tracing::OperationName::Egress) {
-      const HeaderEntry* resp_operation_override = headers.EnvoyDecoratorOperation();
-
-      // For Egress (outbound) response, if a decorator operation name has been provided, it
-      // should be used to override the active span's operation.
-      if (resp_operation_override) {
-        if (!resp_operation_override->value().empty() && active_span_) {
-          active_span_->setOperation(resp_operation_override->value().getStringView());
-        }
-        // Remove header so not propagated to service.
-        headers.removeEnvoyDecoratorOperation();
-      }
+  if (active_span_ != nullptr) {
+    ASSERT(connection_manager_tracing_config_.has_value());
+    if (!operationNameFormatter(*connection_manager_tracing_config_, route_tracing_)) {
+      // Only apply decorator if there is no operation name formatter configured at either
+      // the HCM level or the route level.
+      setResponseDecorator(headers);
     }
   }
 
@@ -1980,7 +2094,8 @@ void ConnectionManagerImpl::ActiveStream::onResetStream(StreamResetReason reset_
 
   // If the codec sets its responseDetails() for a reason other than peer reset, set a
   // DownstreamProtocolError. Either way, propagate details.
-  if (!encoder_details.empty() && reset_reason == StreamResetReason::LocalReset) {
+  if (reset_reason == StreamResetReason::ProtocolError ||
+      (!encoder_details.empty() && reset_reason == StreamResetReason::LocalReset)) {
     filter_manager_.streamInfo().setResponseFlag(
         StreamInfo::CoreResponseFlag::DownstreamProtocolError);
   }
@@ -2034,7 +2149,7 @@ void ConnectionManagerImpl::ActiveStream::onCodecEncodeComplete() {
 void ConnectionManagerImpl::ActiveStream::onCodecLowLevelReset() {
   ASSERT(!state_.codec_encode_complete_);
   state_.on_reset_stream_called_ = true;
-  ENVOY_STREAM_LOG(debug, "Codec timed out flushing stream", *this);
+  ENVOY_STREAM_LOG(debug, "Codec low level reset", *this);
 
   // TODO(kbaichoo): Update streamInfo to account for the reset.
 
@@ -2049,8 +2164,48 @@ Tracing::OperationName ConnectionManagerImpl::ActiveStream::operationName() cons
   return connection_manager_tracing_config_->operation_name_;
 }
 
-const Tracing::CustomTagMap* ConnectionManagerImpl::ActiveStream::customTags() const {
-  return tracing_custom_tags_.get();
+void ConnectionManagerImpl::ActiveStream::modifySpan(Tracing::Span& span,
+                                                     bool upstream_span) const {
+  ASSERT(connection_manager_tracing_config_.has_value());
+
+  const Tracing::HttpTraceContext trace_context(*request_headers_);
+  const Formatter::Context formatter_context{
+      request_headers_.get(), response_headers_.get(), response_trailers_.get(), {}, {},
+      active_span_.get()};
+  const Tracing::CustomTagContext ctx{trace_context, filter_manager_.streamInfo(),
+                                      formatter_context};
+
+  // Cache the optional custom tags from the route first.
+  OptRef<const Tracing::CustomTagMap> route_custom_tags;
+
+  if (route_tracing_ != nullptr) {
+    route_custom_tags.emplace(route_tracing_->getCustomTags());
+    for (const auto& tag : *route_custom_tags) {
+      tag.second->applySpan(span, ctx);
+    }
+  }
+
+  for (const auto& tag : connection_manager_tracing_config_->custom_tags_) {
+    if (!route_custom_tags.has_value() || !route_custom_tags->contains(tag.first)) {
+      // If the tag is defined in both the connection manager and the route,
+      // use the route's tag.
+      tag.second->applySpan(span, ctx);
+    }
+  }
+
+  // For same stream, there is only one downstream span. It's the active span.
+  // So we can determine whether the span is downstream span by comparing the
+  // span pointer.
+  const Formatter::Formatter* operation =
+      upstream_span
+          ? upstreamOperationNameFormatter(*connection_manager_tracing_config_, route_tracing_)
+          : operationNameFormatter(*connection_manager_tracing_config_, route_tracing_);
+  if (operation != nullptr) {
+    const auto op = operation->format(formatter_context, filter_manager_.streamInfo());
+    if (!op.empty()) {
+      span.setOperation(op);
+    }
+  }
 }
 
 bool ConnectionManagerImpl::ActiveStream::verbose() const {
@@ -2113,6 +2268,15 @@ ConnectionManagerImpl::ActiveStream::route(const Router::RouteCallback& cb) {
   return cached_route_.value();
 }
 
+void ConnectionManagerImpl::ActiveStream::setRoute(Router::RouteConstSharedPtr route) {
+  Router::VirtualHostRoute vhost_route;
+  if (route != nullptr) {
+    vhost_route.vhost = route->virtualHost();
+    vhost_route.route = std::move(route);
+  }
+  setVirtualHostRoute(std::move(vhost_route));
+}
+
 /**
  * Sets the cached route to the RouteConstSharedPtr argument passed in. Handles setting the
  * cached_route_/cached_cluster_info_ ActiveStream attributes, the FilterManager streamInfo, tracing
@@ -2121,14 +2285,15 @@ ConnectionManagerImpl::ActiveStream::route(const Router::RouteCallback& cb) {
  * Declared as a StreamFilterCallbacks member function for filters to call directly, but also
  * functions as a helper to refreshCachedRoute(const Router::RouteCallback& cb).
  */
-void ConnectionManagerImpl::ActiveStream::setRoute(Router::RouteConstSharedPtr route) {
+void ConnectionManagerImpl::ActiveStream::setVirtualHostRoute(
+    Router::VirtualHostRoute vhost_route) {
   // If the cached route is blocked then any attempt to clear it or refresh it
   // will be ignored.
-  // setRoute() may be called directly by the interface of DownstreamStreamFilterCallbacks,
-  // so check for routeCacheBlocked() here again.
   if (routeCacheBlocked()) {
     return;
   }
+
+  Router::RouteConstSharedPtr route = std::move(vhost_route.route);
 
   // Update the cached route.
   setCachedRoute({route});
@@ -2141,35 +2306,51 @@ void ConnectionManagerImpl::ActiveStream::setRoute(Router::RouteConstSharedPtr r
     cached_cluster_info_ = (nullptr == cluster) ? nullptr : cluster->info();
   }
 
-  // Update route and cluster info in the filter manager's stream info.
-  filter_manager_.streamInfo().route_ = std::move(route); // Now can move route here safely.
+  // Update route, vhost and cluster info in the filter manager's stream info.
+  // Now can move route here safely.
+  filter_manager_.streamInfo().route_ = std::move(route);
+  filter_manager_.streamInfo().vhost_ = std::move(vhost_route.vhost);
   filter_manager_.streamInfo().setUpstreamClusterInfo(cached_cluster_info_.value());
 
-  refreshCachedTracingCustomTags();
+  refreshTracing();
   refreshDurationTimeout();
-  refreshIdleTimeout();
+  refreshIdleAndFlushTimeouts();
+  refreshBufferLimit();
 }
 
-void ConnectionManagerImpl::ActiveStream::refreshIdleTimeout() {
-  if (hasCachedRoute()) {
-    const Router::RouteEntry* route_entry = cached_route_.value()->routeEntry();
-    if (route_entry != nullptr && route_entry->idleTimeout()) {
-      idle_timeout_ms_ = route_entry->idleTimeout().value();
-      response_encoder_->getStream().setFlushTimeout(idle_timeout_ms_);
-      if (idle_timeout_ms_.count()) {
-        // If we have a route-level idle timeout but no global stream idle timeout, create a timer.
-        if (stream_idle_timer_ == nullptr) {
-          stream_idle_timer_ = connection_manager_.dispatcher_->createScaledTimer(
-              Event::ScaledTimerType::HttpDownstreamIdleStreamTimeout,
-              [this]() -> void { onIdleTimeout(); });
-        }
-      } else if (stream_idle_timer_ != nullptr) {
-        // If we had a global stream idle timeout but the route-level idle timeout is set to zero
-        // (to override), we disable the idle timer.
-        stream_idle_timer_->disableTimer();
-        stream_idle_timer_ = nullptr;
+void ConnectionManagerImpl::ActiveStream::refreshIdleAndFlushTimeouts() {
+  if (!hasCachedRoute()) {
+    return;
+  }
+  const Router::RouteEntry* route_entry = cached_route_.value()->routeEntry();
+  if (route_entry == nullptr) {
+    return;
+  }
+
+  if (route_entry->idleTimeout().has_value()) {
+    idle_timeout_ms_ = route_entry->idleTimeout().value();
+    if (idle_timeout_ms_.count()) {
+      // If we have a route-level idle timeout but no global stream idle timeout, create a timer.
+      if (stream_idle_timer_ == nullptr) {
+        stream_idle_timer_ = connection_manager_.dispatcher_->createScaledTimer(
+            Event::ScaledTimerType::HttpDownstreamIdleStreamTimeout,
+            [this]() -> void { onIdleTimeout(); });
       }
+    } else if (stream_idle_timer_ != nullptr) {
+      // If we had a global stream idle timeout but the route-level idle timeout is set to zero
+      // (to override), we disable the idle timer.
+      stream_idle_timer_->disableTimer();
+      stream_idle_timer_ = nullptr;
     }
+  }
+
+  if (route_entry->flushTimeout().has_value()) {
+    response_encoder_->getStream().setFlushTimeout(route_entry->flushTimeout().value());
+  } else if (!has_explicit_global_flush_timeout_ && route_entry->idleTimeout().has_value()) {
+    // If there is no route-level flush timeout, and the global flush timeout was also inherited
+    // from the idle timeout, also inherit the route-level idle timeout. This is for backwards
+    // compatibility.
+    response_encoder_->getStream().setFlushTimeout(idle_timeout_ms_);
   }
 }
 
@@ -2177,6 +2358,28 @@ void ConnectionManagerImpl::ActiveStream::refreshAccessLogFlushTimer() {
   if (connection_manager_.config_->accessLogFlushInterval().has_value()) {
     access_log_flush_timer_->enableTimer(
         connection_manager_.config_->accessLogFlushInterval().value(), this);
+  }
+}
+
+void ConnectionManagerImpl::ActiveStream::refreshBufferLimit() {
+  if (!hasCachedRoute()) {
+    return;
+  }
+  const Router::RouteEntry* route_entry = cached_route_.value()->routeEntry();
+  if (route_entry == nullptr) {
+    return;
+  }
+
+  const uint64_t buffer_limit = route_entry->requestBodyBufferLimit();
+  if (buffer_limit == std::numeric_limits<uint64_t>::max()) {
+    // Max uint64_t means no valid limit configured.
+    return;
+  }
+  // Only increase the buffer limit automatically. This is to ensure same
+  // behavior as previous logic in router filter.
+  if (buffer_limit > filter_manager_.bufferLimit()) {
+    ENVOY_STREAM_LOG(debug, "Setting new filter manager buffer limit: {}", *this, buffer_limit);
+    filter_manager_.setBufferLimit(buffer_limit);
   }
 }
 
@@ -2188,10 +2391,27 @@ void ConnectionManagerImpl::ActiveStream::clearRouteCache() {
   }
 
   setCachedRoute({});
-
   cached_cluster_info_ = absl::optional<Upstream::ClusterInfoConstSharedPtr>();
-  if (tracing_custom_tags_) {
-    tracing_custom_tags_->clear();
+}
+
+void ConnectionManagerImpl::ActiveStream::refreshRouteCluster() {
+  // If there is no cached route, or route cache is frozen, or the request headers are not
+  // available, then do not refresh the route cluster.
+  if (!hasCachedRoute() || routeCacheBlocked() || request_headers_ == nullptr) {
+    return;
+  }
+  if (const auto* entry = (*cached_route_)->routeEntry(); entry != nullptr) {
+    // Refresh the cluster if possible.
+    entry->refreshRouteCluster(*request_headers_, filter_manager_.streamInfo());
+
+    // Refresh the cached cluster info is necessary.
+    if (!cached_cluster_info_.has_value() || cached_cluster_info_.value() == nullptr ||
+        (*cached_cluster_info_)->name() != entry->clusterName()) {
+      auto* cluster =
+          connection_manager_.cluster_manager_.getThreadLocalCluster(entry->clusterName());
+      cached_cluster_info_ = (nullptr == cluster) ? nullptr : cluster->info();
+      filter_manager_.streamInfo().setUpstreamClusterInfo(cached_cluster_info_.value());
+    }
   }
 }
 

@@ -1,17 +1,5 @@
 #include "source/extensions/filters/http/aws_lambda/config.h"
 
-#include "envoy/common/optref.h"
-#include "envoy/extensions/filters/http/aws_lambda/v3/aws_lambda.pb.validate.h"
-#include "envoy/registry/registry.h"
-#include "envoy/stats/scope.h"
-#include "envoy/stats/stats_macros.h"
-
-#include "source/common/common/fmt.h"
-#include "source/extensions/common/aws/credentials_provider_impl.h"
-#include "source/extensions/common/aws/sigv4_signer_impl.h"
-#include "source/extensions/common/aws/utility.h"
-#include "source/extensions/filters/http/aws_lambda/aws_lambda_filter.h"
-
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
@@ -64,8 +52,8 @@ AwsLambdaFilterFactory::getCredentialsProvider(
         server_context, credential_file_config));
     return chain;
   }
-  return std::make_shared<Extensions::Common::Aws::DefaultCredentialsProviderChain>(
-      server_context.api(), makeOptRef(server_context), region, nullptr);
+  return Extensions::Common::Aws::CommonCredentialsProviderChain::defaultCredentialsProviderChain(
+      server_context, region);
 }
 
 absl::StatusOr<Http::FilterFactoryCb> AwsLambdaFilterFactory::createFilterFactoryFromProtoTyped(
@@ -86,7 +74,8 @@ absl::StatusOr<Http::FilterFactoryCb> AwsLambdaFilterFactory::createFilterFactor
       service_name, region, std::move(credentials_provider), server_context,
       // TODO: extend API to allow specifying header exclusion. ref:
       // https://github.com/envoyproxy/envoy/pull/18998
-      Extensions::Common::Aws::AwsSigningHeaderExclusionVector{});
+      Extensions::Common::Aws::AwsSigningHeaderMatcherVector{},
+      Extensions::Common::Aws::AwsSigningHeaderMatcherVector{});
 
   auto filter_settings = std::make_shared<FilterSettingsImpl>(
       *arn, getInvocationMode(proto_config), proto_config.payload_passthrough(),
@@ -118,7 +107,8 @@ AwsLambdaFilterFactory::createRouteSpecificFilterConfigTyped(
       service_name, region, std::move(credentials_provider), server_context,
       // TODO: extend API to allow specifying header exclusion. ref:
       // https://github.com/envoyproxy/envoy/pull/18998
-      Extensions::Common::Aws::AwsSigningHeaderExclusionVector{});
+      Extensions::Common::Aws::AwsSigningHeaderMatcherVector{},
+      Extensions::Common::Aws::AwsSigningHeaderMatcherVector{});
 
   auto filter_settings = std::make_shared<FilterSettingsImpl>(
       *arn, getInvocationMode(per_route_config.invoke_config()),

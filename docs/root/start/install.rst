@@ -33,6 +33,14 @@ Install Envoy on Debian-based Linux
       $ sudo apt-get install envoy
       $ envoy --version
 
+   .. code-tab:: console Debian trixie
+
+      $ wget -O- https://apt.envoyproxy.io/signing.key | sudo gpg --dearmor -o /etc/apt/keyrings/envoy-keyring.gpg
+      $ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/envoy-keyring.gpg] https://apt.envoyproxy.io trixie main" | sudo tee /etc/apt/sources.list.d/envoy.list
+      $ sudo apt-get update
+      $ sudo apt-get install envoy
+      $ envoy --version
+
    .. code-tab:: console Ubuntu focal
 
       $ wget -O- https://apt.envoyproxy.io/signing.key | sudo gpg --dearmor -o /etc/apt/keyrings/envoy-keyring.gpg
@@ -45,6 +53,14 @@ Install Envoy on Debian-based Linux
 
       $ wget -O- https://apt.envoyproxy.io/signing.key | sudo gpg --dearmor -o /etc/apt/keyrings/envoy-keyring.gpg
       $ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/envoy-keyring.gpg] https://apt.envoyproxy.io jammy main" | sudo tee /etc/apt/sources.list.d/envoy.list
+      $ sudo apt-get update
+      $ sudo apt-get install envoy
+      $ envoy --version
+
+   .. code-tab:: console Ubuntu noble
+
+      $ wget -O- https://apt.envoyproxy.io/signing.key | sudo gpg --dearmor -o /etc/apt/keyrings/envoy-keyring.gpg
+      $ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/envoy-keyring.gpg] https://apt.envoyproxy.io noble main" | sudo tee /etc/apt/sources.list.d/envoy.list
       $ sudo apt-get update
       $ sudo apt-get install envoy
       $ envoy --version
@@ -132,8 +148,7 @@ The Envoy project currently supports ``amd64`` and ``arm64`` architectures for i
 
 Contrib builds
 ^^^^^^^^^^^^^^
-As described in `this document <https://docs.google.com/document/d/1yl7GOZK1TDm_7vxQvt8UQEAu07UQFru1uEKXM6ZZg_g/edit#>`_,
-the Envoy project allows extensions to enter the repository as "contrib" extensions. The requirements
+Envoy project allows extensions to enter the repository as "contrib" extensions. The requirements
 for such extensions are lower, and as such they are only available by default in special images.
 
 Throughout the documentation, extensions are clearly marked as being a contrib extension or a core extension.

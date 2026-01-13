@@ -32,7 +32,6 @@
 #ifdef ENVOY_ENABLE_QUIC
 #include "quiche/common/platform/api/quiche_flags.h"
 #endif
-ABSL_DECLARE_FLAG(bool, envoy_reloadable_features_boolean_to_string_fix);
 
 using testing::_;
 using testing::Invoke;
@@ -113,7 +112,7 @@ public:
     EXPECT_TRUE(on_changed_cbs_[layer](Filesystem::Watcher::Events::MovedTo).ok());
   }
 
-  ProtobufWkt::Struct base_;
+  Protobuf::Struct base_;
 };
 
 TEST_F(DiskLoaderImplTest, EmptyKeyTest) {
@@ -277,7 +276,7 @@ TEST_F(DiskLoaderImplTest, UintLargeIntegerConversion) {
 }
 
 TEST_F(DiskLoaderImplTest, GetLayers) {
-  base_ = TestUtility::parseYaml<ProtobufWkt::Struct>(R"EOF(
+  base_ = TestUtility::parseYaml<Protobuf::Struct>(R"EOF(
     foo: whatevs
   )EOF");
   setup();
@@ -479,7 +478,7 @@ TEST_F(DiskLoaderImplTest, MergeValues) {
 
 // Validate that admin overrides disk, disk overrides bootstrap.
 TEST_F(DiskLoaderImplTest, LayersOverride) {
-  base_ = TestUtility::parseYaml<ProtobufWkt::Struct>(R"EOF(
+  base_ = TestUtility::parseYaml<Protobuf::Struct>(R"EOF(
     some: thing
     other: thang
     file2: whatevs
@@ -551,7 +550,7 @@ protected:
     loader_ = std::move(loader.value());
   }
 
-  ProtobufWkt::Struct base_;
+  Protobuf::Struct base_;
 };
 
 TEST_F(StaticLoaderImplTest, All) {
@@ -575,7 +574,7 @@ TEST_F(StaticLoaderImplTest, QuicheReloadableFlags) {
   EXPECT_FALSE(GetQuicheReloadableFlag(quic_testonly_default_false));
 
   // Test that Quiche flags can be overwritten via Envoy runtime config.
-  base_ = TestUtility::parseYaml<ProtobufWkt::Struct>(
+  base_ = TestUtility::parseYaml<Protobuf::Struct>(
       "envoy.reloadable_features.FLAGS_envoy_quiche_reloadable_flag_quic_testonly_default_true: "
       "true");
   setup();
@@ -584,7 +583,7 @@ TEST_F(StaticLoaderImplTest, QuicheReloadableFlags) {
   EXPECT_FALSE(GetQuicheReloadableFlag(quic_testonly_default_false));
 
   // Test that Quiche flags can be overwritten again.
-  base_ = TestUtility::parseYaml<ProtobufWkt::Struct>(
+  base_ = TestUtility::parseYaml<Protobuf::Struct>(
       "envoy.reloadable_features.FLAGS_envoy_quiche_reloadable_flag_quic_testonly_default_true: "
       "false");
   setup();
@@ -595,20 +594,20 @@ TEST_F(StaticLoaderImplTest, QuicheReloadableFlags) {
 #endif
 
 TEST_F(StaticLoaderImplTest, RemovedFlags) {
-  base_ = TestUtility::parseYaml<ProtobufWkt::Struct>(R"EOF(
+  base_ = TestUtility::parseYaml<Protobuf::Struct>(R"EOF(
     envoy.reloadable_features.removed_foo: true
   )EOF");
   EXPECT_ENVOY_BUG(setup(), "envoy.reloadable_features.removed_foo");
 }
 
 TEST_F(StaticLoaderImplTest, ProtoParsingInvalidField) {
-  base_ = TestUtility::parseYaml<ProtobufWkt::Struct>("file0:");
+  base_ = TestUtility::parseYaml<Protobuf::Struct>("file0:");
   EXPECT_THROW_WITH_MESSAGE(setup(), EnvoyException, "Invalid runtime entry value for file0");
 }
 
 TEST_F(StaticLoaderImplTest, ProtoParsing) {
   // Validate proto parsing sanity.
-  base_ = TestUtility::parseYaml<ProtobufWkt::Struct>(R"EOF(
+  base_ = TestUtility::parseYaml<Protobuf::Struct>(R"EOF(
     file1: hello override
     file2: world
     file3: 2
@@ -756,13 +755,44 @@ TEST_F(StaticLoaderImplTest, ProtoParsing) {
   EXPECT_EQ(2, store_.gauge("runtime.num_layers", Stats::Gauge::ImportMode::NeverImport).value());
 
   // While null values are generally filtered out by walkProtoValue, test manually.
-  ProtobufWkt::Value empty_value;
+  Protobuf::Value empty_value;
   const_cast<SnapshotImpl&>(dynamic_cast<const SnapshotImpl&>(loader_->snapshot()))
       .createEntry(empty_value, "");
 }
 
+// Test that an ENVOY_BUG is emitted for a value with `envoy.reloadable_features` as a prefix which
+// isn't an actual feature flag.
+TEST_F(StaticLoaderImplTest, ProtoParsingRuntimeFeaturePrefix) {
+  // Validate proto parsing sanity.
+  base_ = TestUtility::parseYaml<Protobuf::Struct>(R"EOF(
+    envoy.reloadable_features.not_a_feature: true
+  )EOF");
+  EXPECT_ENVOY_BUG(setup(),
+                   "Using a removed guard envoy.reloadable_features.not_a_feature. In future "
+                   "version of Envoy this will be treated as invalid configuration");
+}
+
+// Test that legacy names do not result in an ENVOY_BUG and the values can be fetched correctly.
+// Success for this test relies on no ENVOY_BUG triggering, which means this would only fail
+// in a debug build if the bug was present.
+TEST_F(StaticLoaderImplTest, ProtoParsingRuntimeFeaturePrefixLegacy) {
+  // Validate proto parsing sanity.
+  base_ = TestUtility::parseYaml<Protobuf::Struct>(R"EOF(
+    envoy.reloadable_features.max_request_headers_count: 2
+    envoy.reloadable_features.max_response_headers_count: 3
+    envoy.reloadable_features.max_request_headers_size_kb: 4
+    envoy.reloadable_features.max_response_headers_size_kb: 5
+  )EOF");
+  setup();
+
+  EXPECT_EQ(2, loader_->snapshot().getInteger(Http::MaxRequestHeadersCountOverrideKey, 0));
+  EXPECT_EQ(3, loader_->snapshot().getInteger(Http::MaxResponseHeadersCountOverrideKey, 0));
+  EXPECT_EQ(4, loader_->snapshot().getInteger(Http::MaxRequestHeadersSizeOverrideKey, 0));
+  EXPECT_EQ(5, loader_->snapshot().getInteger(Http::MaxResponseHeadersSizeOverrideKey, 0));
+}
+
 TEST_F(StaticLoaderImplTest, InvalidNumerator) {
-  base_ = TestUtility::parseYaml<ProtobufWkt::Struct>(R"EOF(
+  base_ = TestUtility::parseYaml<Protobuf::Struct>(R"EOF(
     invalid_numerator:
       numerator: 111
       denominator: HUNDRED
@@ -894,8 +924,7 @@ public:
     LoaderImplTest::setup();
 
     envoy::config::bootstrap::v3::LayeredRuntime config;
-    *config.add_layers()->mutable_static_layer() =
-        TestUtility::parseYaml<ProtobufWkt::Struct>(R"EOF(
+    *config.add_layers()->mutable_static_layer() = TestUtility::parseYaml<Protobuf::Struct>(R"EOF(
     foo: whatevs
     bar: yar
   )EOF");
@@ -1261,10 +1290,8 @@ TEST_F(RtdsLoaderImplTest, BadConfigSource) {
                             "bad config");
 }
 
-TEST_F(RtdsLoaderImplTest, BooleanToStringConversionWhenFlagEnabled) {
+TEST_F(RtdsLoaderImplTest, BooleanToStringConversion) {
   setup();
-
-  absl::SetFlag(&FLAGS_envoy_reloadable_features_boolean_to_string_fix, true);
 
   auto runtime = TestUtility::parseYaml<envoy::service::runtime::v3::Runtime>(R"EOF(
     name: some_resource
@@ -1276,23 +1303,6 @@ TEST_F(RtdsLoaderImplTest, BooleanToStringConversionWhenFlagEnabled) {
   doOnConfigUpdateVerifyNoThrow(runtime);
 
   EXPECT_EQ("true", loader_->snapshot().get("toggle").value().get());
-}
-
-TEST_F(RtdsLoaderImplTest, BooleanToStringConversionWhenFlagDisabled) {
-  setup();
-
-  absl::SetFlag(&FLAGS_envoy_reloadable_features_boolean_to_string_fix, false);
-
-  auto runtime = TestUtility::parseYaml<envoy::service::runtime::v3::Runtime>(R"EOF(
-    name: some_resource
-    layer:
-      toggle: true
-  )EOF");
-
-  EXPECT_CALL(rtds_init_callback_, Call());
-  doOnConfigUpdateVerifyNoThrow(runtime);
-
-  EXPECT_EQ("1", loader_->snapshot().get("toggle").value().get()); // Assuming previous behavior
 }
 
 } // namespace

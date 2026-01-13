@@ -14,6 +14,7 @@
 
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/logger.h"
+#include "source/extensions/filters/http/ext_proc/processing_effect.h"
 
 #include "absl/status/status.h"
 #include "matching_utils.h"
@@ -45,6 +46,7 @@ public:
   QueuedChunkPtr pop(Buffer::OwnedImpl& out_data);
   const QueuedChunk& consolidate();
   Buffer::OwnedImpl& receivedData() { return received_data_; }
+  const std::deque<QueuedChunkPtr>& queue() const { return queue_; }
 
 private:
   std::deque<QueuedChunkPtr> queue_;
@@ -75,15 +77,21 @@ public:
     TrailersCallback,
   };
 
-  explicit ProcessorState(Filter& filter,
-                          envoy::config::core::v3::TrafficDirection traffic_direction,
-                          const std::vector<std::string>& untyped_forwarding_namespaces,
-                          const std::vector<std::string>& typed_forwarding_namespaces,
-                          const std::vector<std::string>& untyped_receiving_namespaces)
+  explicit ProcessorState(
+      Filter& filter, envoy::config::core::v3::TrafficDirection traffic_direction,
+      const std::vector<std::string>& untyped_forwarding_namespaces,
+      const std::vector<std::string>& typed_forwarding_namespaces,
+      const std::vector<std::string>& untyped_receiving_namespaces,
+      const std::vector<std::string>& untyped_cluster_metadata_forwarding_namespaces,
+      const std::vector<std::string>& typed_cluster_metadata_forwarding_namespaces)
       : filter_(filter), traffic_direction_(traffic_direction),
         untyped_forwarding_namespaces_(&untyped_forwarding_namespaces),
         typed_forwarding_namespaces_(&typed_forwarding_namespaces),
-        untyped_receiving_namespaces_(&untyped_receiving_namespaces) {}
+        untyped_receiving_namespaces_(&untyped_receiving_namespaces),
+        untyped_cluster_metadata_forwarding_namespaces_(
+            &untyped_cluster_metadata_forwarding_namespaces),
+        typed_cluster_metadata_forwarding_namespaces_(
+            &typed_cluster_metadata_forwarding_namespaces) {}
   ProcessorState(const ProcessorState&) = delete;
   virtual ~ProcessorState() = default;
   ProcessorState& operator=(const ProcessorState&) = delete;
@@ -100,6 +108,7 @@ public:
 
   bool completeBodyAvailable() const { return complete_body_available_; }
   void setCompleteBodyAvailable(bool d) { complete_body_available_ = d; }
+  bool hasNoBody() const { return no_body_; }
   void setHasNoBody(bool b) { no_body_ = b; }
   bool bodyReplaced() const { return body_replaced_; }
   bool bodyReceived() const { return body_received_; }
@@ -129,6 +138,18 @@ public:
   void setUntypedReceivingMetadataNamespaces(const std::vector<std::string>& ns) {
     untyped_receiving_namespaces_ = &ns;
   };
+  const std::vector<std::string>& untypedClusterMetadataForwardingNamespaces() const {
+    return *untyped_cluster_metadata_forwarding_namespaces_;
+  }
+  void setUntypedClusterMetadataForwardingNamespaces(const std::vector<std::string>& ns) {
+    untyped_cluster_metadata_forwarding_namespaces_ = &ns;
+  }
+  const std::vector<std::string>& typedClusterMetadataForwardingNamespaces() const {
+    return *typed_cluster_metadata_forwarding_namespaces_;
+  }
+  void setTypedClusterMetadataForwardingNamespaces(const std::vector<std::string>& ns) {
+    typed_cluster_metadata_forwarding_namespaces_ = &ns;
+  }
 
   bool sendHeaders() const { return send_headers_; }
   bool sendTrailers() const { return send_trailers_; }
@@ -146,10 +167,12 @@ public:
   virtual const Http::RequestOrResponseHeaderMap* responseHeaders() const PURE;
   const Http::HeaderMap* responseTrailers() const { return trailers_; }
 
+  const absl::optional<MonotonicTime>& getCallStartTime() const { return call_start_time_; }
   void onStartProcessorCall(Event::TimerCb cb, std::chrono::milliseconds timeout,
                             CallbackState callback_state);
   void onFinishProcessorCall(Grpc::Status::GrpcStatus call_status,
                              CallbackState next_state = CallbackState::Idle);
+  void logMutation(CallbackState callback_state, ProcessingEffect::Effect processing_effect);
   void stopMessageTimer();
   bool restartMessageTimer(const uint32_t message_timeout_ms);
 
@@ -210,7 +233,7 @@ public:
 
   virtual void continueProcessing() const PURE;
   void continueIfNecessary();
-  void clearAsyncState();
+  void clearAsyncState(Grpc::Status::GrpcStatus call_status = Grpc::Status::Aborted);
 
   virtual envoy::service::ext_proc::v3::HttpHeaders*
   mutableHeaders(envoy::service::ext_proc::v3::ProcessingRequest& request) const PURE;
@@ -225,7 +248,7 @@ public:
 
   void setSentAttributes(bool sent) { attributes_sent_ = sent; }
 
-  virtual ProtobufWkt::Struct
+  virtual Protobuf::Struct
   evaluateAttributes(const ExpressionManager& mgr,
                      const Filters::Common::Expr::Activation& activation) const PURE;
 
@@ -282,7 +305,8 @@ protected:
   const std::vector<std::string>* untyped_forwarding_namespaces_{};
   const std::vector<std::string>* typed_forwarding_namespaces_{};
   const std::vector<std::string>* untyped_receiving_namespaces_{};
-
+  const std::vector<std::string>* untyped_cluster_metadata_forwarding_namespaces_{};
+  const std::vector<std::string>* typed_cluster_metadata_forwarding_namespaces_{};
   // If true, the attributes for this processing state have already been sent.
   bool attributes_sent_{};
 
@@ -294,10 +318,56 @@ private:
       const envoy::service::ext_proc::v3::CommonResponse& common_response);
   void sendBufferedDataInStreamedMode(bool end_stream);
   absl::Status
-  processHeaderMutation(const envoy::service::ext_proc::v3::CommonResponse& common_response);
+  processHeaderMutation(const envoy::service::ext_proc::v3::CommonResponse& common_response,
+                        ProcessingEffect::Effect& processing_effect);
   void clearStreamingChunk() { chunk_queue_.clear(); }
   CallbackState getCallbackStateAfterHeaderResp(
       const envoy::service::ext_proc::v3::CommonResponse& common_response) const;
+
+  /**
+   * Handle the header response with CONTINUE_AND_REPLACE action from external processor.
+   *
+   * @param response HeadersResponse with replace directives
+   * @return Status of the operation
+   */
+  absl::Status
+  handleHeaderContinueAndReplace(const envoy::service::ext_proc::v3::HeadersResponse& response);
+
+  /**
+   * Handle the header response with CONTINUE action from external processor.
+   * Routes to appropriate handler based on body state and processing mode
+   * (none, buffered, streamed, partial, or full-duplex).
+   *
+   * @return Status of the operation
+   */
+  absl::Status handleHeaderContinue();
+
+  /**
+   * Handle the body when the complete body is already available.
+   * Sends buffered body to processor based on callback state,
+   * manages streamed data, and continues filter chain when appropriate.
+   *
+   * @return Status of the operation
+   */
+  absl::Status handleCompleteBodyAvailable();
+
+  /**
+   * Handle partial body buffering with watermark control when geting a header response.
+   * Enqueues buffered data, sends chunks when high watermark is reached,
+   * and holds headers during buffering phase.
+   *
+   * @return Status of the operation
+   */
+  absl::Status handleBufferedPartialMode();
+
+  /**
+   * Finalizes processing by handling trailers and cleanup.
+   * Either sends available trailers to processor or cleans up resources
+   * by clearing headers, notifying filter, and continuing the chain.
+   *
+   * @return Status of the operation
+   */
+  absl::Status handleTrailersAndCleanup();
 
   /**
    * Validates if the current callback state is valid for processing body responses.
@@ -345,7 +415,8 @@ private:
    *         or an error status on failure
    */
   absl::Status processHeaderMutationIfAvailable(
-      const envoy::service::ext_proc::v3::CommonResponse& common_response);
+      const envoy::service::ext_proc::v3::CommonResponse& common_response,
+      ProcessingEffect::Effect& effect);
 
   /**
    * Validates content length against body mutation size. Content-length header is only
@@ -365,7 +436,8 @@ private:
    * @param common_response The common response containing body mutations to apply
    */
   void
-  applyBufferedBodyMutation(const envoy::service::ext_proc::v3::CommonResponse& common_response);
+  applyBufferedBodyMutation(const envoy::service::ext_proc::v3::CommonResponse& common_response,
+                            ProcessingEffect::Effect& effect);
 
   /**
    * Finalizes body response processing by handling trailers and continuation.
@@ -381,10 +453,13 @@ public:
       Filter& filter, const envoy::extensions::filters::http::ext_proc::v3::ProcessingMode& mode,
       const std::vector<std::string>& untyped_forwarding_namespaces,
       const std::vector<std::string>& typed_forwarding_namespaces,
-      const std::vector<std::string>& untyped_receiving_namespaces)
+      const std::vector<std::string>& untyped_receiving_namespaces,
+      const std::vector<std::string>& untyped_cluster_metadata_forwarding_namespaces,
+      const std::vector<std::string>& typed_cluster_metadata_forwarding_namespaces)
       : ProcessorState(filter, envoy::config::core::v3::TrafficDirection::INBOUND,
                        untyped_forwarding_namespaces, typed_forwarding_namespaces,
-                       untyped_receiving_namespaces) {
+                       untyped_receiving_namespaces, untyped_cluster_metadata_forwarding_namespaces,
+                       typed_cluster_metadata_forwarding_namespaces) {
     setProcessingModeInternal(mode);
   }
   DecodingProcessorState(const DecodingProcessorState&) = delete;
@@ -450,7 +525,7 @@ public:
   }
 
   const Http::RequestOrResponseHeaderMap* responseHeaders() const override { return nullptr; }
-  ProtobufWkt::Struct
+  Protobuf::Struct
   evaluateAttributes(const ExpressionManager& mgr,
                      const Filters::Common::Expr::Activation& activation) const override {
     return mgr.evaluateRequestAttributes(activation);
@@ -472,10 +547,13 @@ public:
       Filter& filter, const envoy::extensions::filters::http::ext_proc::v3::ProcessingMode& mode,
       const std::vector<std::string>& untyped_forwarding_namespaces,
       const std::vector<std::string>& typed_forwarding_namespaces,
-      const std::vector<std::string>& untyped_receiving_namespaces)
+      const std::vector<std::string>& untyped_receiving_namespaces,
+      const std::vector<std::string>& untyped_cluster_metadata_forwarding_namespaces,
+      const std::vector<std::string>& typed_cluster_metadata_forwarding_namespaces)
       : ProcessorState(filter, envoy::config::core::v3::TrafficDirection::OUTBOUND,
                        untyped_forwarding_namespaces, typed_forwarding_namespaces,
-                       untyped_receiving_namespaces) {
+                       untyped_receiving_namespaces, untyped_cluster_metadata_forwarding_namespaces,
+                       typed_cluster_metadata_forwarding_namespaces) {
     setProcessingModeInternal(mode);
   }
   EncodingProcessorState(const EncodingProcessorState&) = delete;
@@ -542,10 +620,16 @@ public:
 
   const Http::RequestOrResponseHeaderMap* responseHeaders() const override { return headers_; }
 
-  ProtobufWkt::Struct
+  Protobuf::Struct
   evaluateAttributes(const ExpressionManager& mgr,
                      const Filters::Common::Expr::Activation& activation) const override {
     return mgr.evaluateResponseAttributes(activation);
+  }
+
+  // Check whether external processing is configured in the encoding path.
+  bool noExternalProcess() const {
+    return (!send_headers_ && !send_trailers_ &&
+            body_mode_ == envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::NONE);
   }
 
 private:

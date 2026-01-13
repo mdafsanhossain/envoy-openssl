@@ -3,12 +3,20 @@ use crate::*;
 use std::sync::atomic::AtomicBool; // This is used for testing the drop, not for the actual concurrency.
 
 #[test]
+fn test_loggers() {
+  // Test that the loggers are defined and can be used during the unit tests, i.e., not trying to
+  // find the symbol implemented by Envoy.
+  envoy_log_trace!("message with an argument: {}", "argument");
+  envoy_log_debug!("message with an argument: {}", "argument");
+  envoy_log_info!("message with an argument: {}", "argument");
+  envoy_log_warn!("message with an argument: {}", "argument");
+  envoy_log_error!("message with an argument: {}", "argument");
+}
+
+#[test]
 fn test_envoy_dynamic_module_on_http_filter_config_new_impl() {
   struct TestHttpFilterConfig;
-  impl<EC: EnvoyHttpFilterConfig, EHF: EnvoyHttpFilter> HttpFilterConfig<EC, EHF>
-    for TestHttpFilterConfig
-  {
-  }
+  impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for TestHttpFilterConfig {}
 
   let mut envoy_filter_config = EnvoyHttpFilterConfigImpl {
     raw_ptr: std::ptr::null_mut(),
@@ -44,10 +52,7 @@ fn test_envoy_dynamic_module_on_http_filter_config_destroy() {
   // Box.
   static DROPPED: AtomicBool = AtomicBool::new(false);
   struct TestHttpFilterConfig;
-  impl<EC: EnvoyHttpFilterConfig, EHF: EnvoyHttpFilter> HttpFilterConfig<EC, EHF>
-    for TestHttpFilterConfig
-  {
-  }
+  impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for TestHttpFilterConfig {}
   impl Drop for TestHttpFilterConfig {
     fn drop(&mut self) {
       DROPPED.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -79,10 +84,8 @@ fn test_envoy_dynamic_module_on_http_filter_config_destroy() {
 fn test_envoy_dynamic_module_on_http_filter_new_destroy() {
   static DROPPED: AtomicBool = AtomicBool::new(false);
   struct TestHttpFilterConfig;
-  impl<EC: EnvoyHttpFilterConfig, EHF: EnvoyHttpFilter> HttpFilterConfig<EC, EHF>
-    for TestHttpFilterConfig
-  {
-    fn new_http_filter(&mut self, _envoy: &mut EC) -> Box<dyn HttpFilter<EHF>> {
+  impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for TestHttpFilterConfig {
+    fn new_http_filter(&self, _envoy: &mut EHF) -> Box<dyn HttpFilter<EHF>> {
       Box::new(TestHttpFilter)
     }
   }
@@ -97,7 +100,7 @@ fn test_envoy_dynamic_module_on_http_filter_new_destroy() {
 
   let mut filter_config = TestHttpFilterConfig;
   let result = envoy_dynamic_module_on_http_filter_new_impl(
-    &mut EnvoyHttpFilterConfigImpl {
+    &mut EnvoyHttpFilterImpl {
       raw_ptr: std::ptr::null_mut(),
     },
     &mut filter_config,
@@ -115,10 +118,8 @@ fn test_envoy_dynamic_module_on_http_filter_new_destroy() {
 // This tests all the on_* methods on the HttpFilter trait through the actual entry points.
 fn test_envoy_dynamic_module_on_http_filter_callbacks() {
   struct TestHttpFilterConfig;
-  impl<EC: EnvoyHttpFilterConfig, EHF: EnvoyHttpFilter> HttpFilterConfig<EC, EHF>
-    for TestHttpFilterConfig
-  {
-    fn new_http_filter(&mut self, _envoy: &mut EC) -> Box<dyn HttpFilter<EHF>> {
+  impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for TestHttpFilterConfig {
+    fn new_http_filter(&self, _envoy: &mut EHF) -> Box<dyn HttpFilter<EHF>> {
       Box::new(TestHttpFilter)
     }
   }
@@ -129,6 +130,7 @@ fn test_envoy_dynamic_module_on_http_filter_callbacks() {
   static ON_RESPONSE_HEADERS_CALLED: AtomicBool = AtomicBool::new(false);
   static ON_RESPONSE_BODY_CALLED: AtomicBool = AtomicBool::new(false);
   static ON_RESPONSE_TRAILERS_CALLED: AtomicBool = AtomicBool::new(false);
+  static ON_STREAM_COMPLETE_CALLED: AtomicBool = AtomicBool::new(false);
 
   struct TestHttpFilter;
   impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for TestHttpFilter {
@@ -183,11 +185,15 @@ fn test_envoy_dynamic_module_on_http_filter_callbacks() {
       ON_RESPONSE_TRAILERS_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
       abi::envoy_dynamic_module_type_on_http_filter_response_trailers_status::Continue
     }
+
+    fn on_stream_complete(&mut self, _envoy_filter: &mut EHF) {
+      ON_STREAM_COMPLETE_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
   }
 
   let mut filter_config = TestHttpFilterConfig;
   let filter = envoy_dynamic_module_on_http_filter_new_impl(
-    &mut EnvoyHttpFilterConfigImpl {
+    &mut EnvoyHttpFilterImpl {
       raw_ptr: std::ptr::null_mut(),
     },
     &mut filter_config,
@@ -218,6 +224,7 @@ fn test_envoy_dynamic_module_on_http_filter_callbacks() {
       envoy_dynamic_module_on_http_filter_response_trailers(std::ptr::null_mut(), filter),
       abi::envoy_dynamic_module_type_on_http_filter_response_trailers_status::Continue
     );
+    envoy_dynamic_module_on_http_filter_stream_complete(std::ptr::null_mut(), filter);
     envoy_dynamic_module_on_http_filter_destroy(filter);
   }
 
@@ -227,4 +234,5 @@ fn test_envoy_dynamic_module_on_http_filter_callbacks() {
   assert!(ON_RESPONSE_HEADERS_CALLED.load(std::sync::atomic::Ordering::SeqCst));
   assert!(ON_RESPONSE_BODY_CALLED.load(std::sync::atomic::Ordering::SeqCst));
   assert!(ON_RESPONSE_TRAILERS_CALLED.load(std::sync::atomic::Ordering::SeqCst));
+  assert!(ON_STREAM_COMPLETE_CALLED.load(std::sync::atomic::Ordering::SeqCst));
 }

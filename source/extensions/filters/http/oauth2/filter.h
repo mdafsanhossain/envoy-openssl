@@ -90,17 +90,20 @@ struct CookieNames {
                   cookie_names)
       : CookieNames(cookie_names.bearer_token(), cookie_names.oauth_hmac(),
                     cookie_names.oauth_expires(), cookie_names.id_token(),
-                    cookie_names.refresh_token(), cookie_names.oauth_nonce()) {}
+                    cookie_names.refresh_token(), cookie_names.oauth_nonce(),
+                    cookie_names.code_verifier()) {}
 
   CookieNames(const std::string& bearer_token, const std::string& oauth_hmac,
               const std::string& oauth_expires, const std::string& id_token,
-              const std::string& refresh_token, const std::string& oauth_nonce)
+              const std::string& refresh_token, const std::string& oauth_nonce,
+              const std::string& code_verifier)
       : bearer_token_(bearer_token.empty() ? BearerToken : bearer_token),
         oauth_hmac_(oauth_hmac.empty() ? OauthHMAC : oauth_hmac),
         oauth_expires_(oauth_expires.empty() ? OauthExpires : oauth_expires),
         id_token_(id_token.empty() ? IdToken : id_token),
         refresh_token_(refresh_token.empty() ? RefreshToken : refresh_token),
-        oauth_nonce_(oauth_nonce.empty() ? OauthNonce : oauth_nonce) {}
+        oauth_nonce_(oauth_nonce.empty() ? OauthNonce : oauth_nonce),
+        code_verifier_(code_verifier.empty() ? CodeVerifier : code_verifier) {}
 
   const std::string bearer_token_;
   const std::string oauth_hmac_;
@@ -108,6 +111,7 @@ struct CookieNames {
   const std::string id_token_;
   const std::string refresh_token_;
   const std::string oauth_nonce_;
+  const std::string code_verifier_;
 
   static constexpr absl::string_view OauthExpires = "OauthExpires";
   static constexpr absl::string_view BearerToken = "BearerToken";
@@ -115,13 +119,14 @@ struct CookieNames {
   static constexpr absl::string_view OauthNonce = "OauthNonce";
   static constexpr absl::string_view IdToken = "IdToken";
   static constexpr absl::string_view RefreshToken = "RefreshToken";
+  static constexpr absl::string_view CodeVerifier = "CodeVerifier";
 };
 
 /**
  * This class encapsulates all data needed for the filter to operate so that we don't pass around
  * raw protobufs and other arbitrary data.
  */
-class FilterConfig {
+class FilterConfig : public Logger::Loggable<Logger::Id::oauth2> {
 public:
   FilterConfig(const envoy::extensions::filters::http::oauth2::v3::OAuth2Config& proto_config,
                Server::Configuration::CommonFactoryContext& context,
@@ -139,6 +144,7 @@ public:
   }
   const HttpUri& oauthTokenEndpoint() const { return oauth_token_endpoint_; }
   const Http::Utility::Url& authorizationEndpointUrl() const { return authorization_endpoint_url_; }
+  const std::string& endSessionEndpoint() const { return end_session_endpoint_; }
   const Http::Utility::QueryParamsMulti& authorizationQueryParams() const {
     return authorization_query_params_;
   }
@@ -157,27 +163,28 @@ public:
   std::chrono::seconds defaultRefreshTokenExpiresIn() const {
     return default_refresh_token_expires_in_;
   }
+  std::chrono::seconds getCsrfTokenExpiresIn() const { return csrf_token_expires_in_; }
+  std::chrono::seconds getCodeVerifierTokenExpiresIn() const {
+    return code_verifier_token_expires_in_;
+  }
   bool disableIdTokenSetCookie() const { return disable_id_token_set_cookie_; }
   bool disableAccessTokenSetCookie() const { return disable_access_token_set_cookie_; }
   bool disableRefreshTokenSetCookie() const { return disable_refresh_token_set_cookie_; }
-  const OptRef<const RouteRetryPolicy> retryPolicy() const {
-    if (!retry_policy_.has_value()) {
-      return absl::nullopt;
-    }
-    return makeOptRef(retry_policy_.value());
-  }
+  const Router::RetryPolicyConstSharedPtr& retryPolicy() const { return retry_policy_; }
   bool shouldUseRefreshToken(
       const envoy::extensions::filters::http::oauth2::v3::OAuth2Config& proto_config) const;
   struct CookieSettings {
     CookieSettings(const envoy::extensions::filters::http::oauth2::v3::CookieConfig& config)
-        : same_site_(config.same_site()) {}
+        : same_site_(config.same_site()), path_(config.path().empty() ? "/" : config.path()) {}
 
-    // Default constructor
+    // Default constructor.
     CookieSettings()
         : same_site_(envoy::extensions::filters::http::oauth2::v3::CookieConfig_SameSite::
-                         CookieConfig_SameSite_DISABLED) {}
+                         CookieConfig_SameSite_DISABLED),
+          path_("/") {}
 
     const envoy::extensions::filters::http::oauth2::v3::CookieConfig_SameSite same_site_;
+    const std::string path_;
   };
 
   const CookieSettings& bearerTokenCookieSettings() const { return bearer_token_cookie_settings_; }
@@ -188,14 +195,20 @@ public:
     return refresh_token_cookie_settings_;
   }
   const CookieSettings& nonceCookieSettings() const { return nonce_cookie_settings_; }
+  const CookieSettings& codeVerifierCookieSettings() const {
+    return code_verifier_cookie_settings_;
+  }
+  bool disableTokenEncryption() const { return disable_token_encryption_; }
 
 private:
-  static FilterStats generateStats(const std::string& prefix, Stats::Scope& scope);
+  static FilterStats generateStats(const std::string& prefix,
+                                   const std::string& filter_stats_prefix, Stats::Scope& scope);
 
   const HttpUri oauth_token_endpoint_;
   // Owns the data exposed by authorization_endpoint_url_.
   const std::string authorization_endpoint_;
   Http::Utility::Url authorization_endpoint_url_;
+  const std::string end_session_endpoint_;
   const Http::Utility::QueryParamsMulti authorization_query_params_;
   const std::string client_id_;
   const std::string redirect_uri_;
@@ -212,19 +225,23 @@ private:
   const AuthType auth_type_;
   const std::chrono::seconds default_expires_in_;
   const std::chrono::seconds default_refresh_token_expires_in_;
+  const std::chrono::seconds csrf_token_expires_in_;
+  const std::chrono::seconds code_verifier_token_expires_in_;
   const bool forward_bearer_token_ : 1;
   const bool preserve_authorization_header_ : 1;
   const bool use_refresh_token_ : 1;
   const bool disable_id_token_set_cookie_ : 1;
   const bool disable_access_token_set_cookie_ : 1;
   const bool disable_refresh_token_set_cookie_ : 1;
-  absl::optional<RouteRetryPolicy> retry_policy_;
+  const bool disable_token_encryption_ : 1;
+  Router::RetryPolicyConstSharedPtr retry_policy_;
   const CookieSettings bearer_token_cookie_settings_;
   const CookieSettings hmac_cookie_settings_;
   const CookieSettings expires_cookie_settings_;
   const CookieSettings id_token_cookie_settings_;
   const CookieSettings refresh_token_cookie_settings_;
   const CookieSettings nonce_cookie_settings_;
+  const CookieSettings code_verifier_cookie_settings_;
 };
 
 using FilterConfigSharedPtr = std::shared_ptr<FilterConfig>;
@@ -250,13 +267,13 @@ public:
   virtual bool canUpdateTokenByRefreshToken() const PURE;
 };
 
-class OAuth2CookieValidator : public CookieValidator {
+class OAuth2CookieValidator : public CookieValidator, Logger::Loggable<Logger::Id::oauth2> {
 public:
   explicit OAuth2CookieValidator(TimeSource& time_source, const CookieNames& cookie_names,
                                  const std::string& cookie_domain)
       : time_source_(time_source), cookie_names_(cookie_names), cookie_domain_(cookie_domain) {}
 
-  const std::string& token() const override { return token_; }
+  const std::string& token() const override { return access_token_; }
   const std::string& refreshToken() const override { return refresh_token_; }
 
   void setParams(const Http::RequestHeaderMap& headers, const std::string& secret) override;
@@ -266,7 +283,7 @@ public:
   bool canUpdateTokenByRefreshToken() const override;
 
 private:
-  std::string token_;
+  std::string access_token_;
   std::string id_token_;
   std::string refresh_token_;
   std::string expires_;
@@ -282,6 +299,7 @@ struct CallbackValidationResult {
   bool is_valid_;
   std::string auth_code_;
   std::string original_request_url_;
+  std::string error_details_;
 };
 
 /**
@@ -294,7 +312,7 @@ class OAuth2Filter : public Http::PassThroughFilter,
                      Logger::Loggable<Logger::Id::oauth2> {
 public:
   OAuth2Filter(FilterConfigSharedPtr config, std::unique_ptr<OAuth2Client>&& oauth_client,
-               TimeSource& time_source, Random::RandomGenerator& randomhmacCookieSettings);
+               TimeSource& time_source, Random::RandomGenerator& random);
 
   // Http::PassThroughFilter
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& headers, bool) override;
@@ -313,7 +331,7 @@ public:
 
   // a catch-all function used for request failures. we don't retry, as a user can simply refresh
   // the page in the case of a network blip.
-  void sendUnauthorizedResponse() override;
+  void sendUnauthorizedResponse(const std::string& details) override;
 
   void finishGetAccessTokenFlow();
   void finishRefreshAccessTokenFlow();
@@ -350,20 +368,24 @@ private:
   bool canRedirectToOAuthServer(Http::RequestHeaderMap& headers) const;
   void redirectToOAuthServer(Http::RequestHeaderMap& headers);
 
-  Http::FilterHeadersStatus signOutUser(const Http::RequestHeaderMap& headers);
+  Http::FilterHeadersStatus signOutUser(const Http::RequestHeaderMap& headers) const;
 
   std::string getEncodedToken() const;
   std::string getExpiresTimeForRefreshToken(const std::string& refresh_token,
                                             const std::chrono::seconds& expires_in) const;
   std::string getExpiresTimeForIdToken(const std::string& id_token,
                                        const std::chrono::seconds& expires_in) const;
-  std::string BuildCookieTail(int cookie_type) const;
+  std::string buildCookieTail(int cookie_type) const;
   void addResponseCookies(Http::ResponseHeaderMap& headers, const std::string& encoded_token) const;
   const std::string& bearerPrefix() const;
   CallbackValidationResult validateOAuthCallback(const Http::RequestHeaderMap& headers,
-                                                 const absl::string_view path_str);
+                                                 const absl::string_view path_str) const;
   bool validateCsrfToken(const Http::RequestHeaderMap& headers,
                          const std::string& csrf_token) const;
+  void decryptAndUpdateOAuthTokenCookies(Http::RequestHeaderMap& headers) const;
+  std::string encryptToken(const std::string& token) const;
+  std::string decryptToken(const std::string& encrypted_token) const;
+  void removeOAuthFlowCookies(Http::RequestHeaderMap& headers) const;
 };
 
 } // namespace Oauth2

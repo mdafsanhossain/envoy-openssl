@@ -24,7 +24,11 @@ envoy_cc_library(
 envoy_cc_library(
     name = "api_listener_interface",
     hdrs = ["api_listener.h"],
-    deps = ["//envoy/http:api_listener_interface"],
+    deps = [
+        "//envoy/config:typed_config_interface",
+        "//envoy/http:api_listener_interface",
+        "@envoy_api//envoy/config/listener/v3:pkg_cc_proto",
+    ],
 )
 
 envoy_cc_library(
@@ -197,6 +201,7 @@ envoy_cc_library(
         "//source/common/common:assert_lib",
         "//source/common/common:macros",
         "//source/common/protobuf",
+        "//source/common/singleton:threadsafe_singleton",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],
 )

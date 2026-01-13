@@ -52,8 +52,6 @@ public class NativeCronvoyEngineBuilderImpl extends CronvoyEngineBuilderImpl {
   private Optional<Integer> mDnsNumRetries = Optional.empty();
   private final List<String> mDnsFallbackNameservers = Collections.emptyList();
   private final boolean mEnableDnsFilterUnroutableFamilies = true;
-  private boolean mUseCares = false;
-  private final List<Pair<String, Integer>> mCaresFallbackResolvers = new ArrayList<>();
   private boolean mEnableDrainPostDnsRefresh = false;
   private final boolean mEnableGzipDecompression = true;
   private final boolean mEnableSocketTag = true;
@@ -70,6 +68,8 @@ public class NativeCronvoyEngineBuilderImpl extends CronvoyEngineBuilderImpl {
   private final boolean mEnablePlatformCertificatesValidation = true;
   private String mUpstreamTlsSni = "";
   private int mH3ConnectionKeepaliveInitialIntervalMilliseconds = 0;
+  private boolean mUseNetworkChangeEvent = false;
+  private boolean mUseV2NetworkMonitor = false;
 
   private final Map<String, Boolean> mRuntimeGuards = new HashMap<>();
 
@@ -88,27 +88,6 @@ public class NativeCronvoyEngineBuilderImpl extends CronvoyEngineBuilderImpl {
    */
   public NativeCronvoyEngineBuilderImpl setEnableDrainPostDnsRefresh(boolean enable) {
     mEnableDrainPostDnsRefresh = enable;
-    return this;
-  }
-
-  /**
-   * Enable using the c_ares DNS resolver.
-   *
-   * @param enable If true, use c_ares.
-   */
-  public NativeCronvoyEngineBuilderImpl setUseCares(boolean enable) {
-    mUseCares = enable;
-    return this;
-  }
-
-  /**
-   * Add a fallback resolver to c_cares.
-   *
-   * @param host ip address string
-   * @param port port for the resolver
-   */
-  public NativeCronvoyEngineBuilderImpl addCaresFallbackResolver(String host, int port) {
-    mCaresFallbackResolvers.add(new Pair<String, Integer>(host, port));
     return this;
   }
 
@@ -135,6 +114,16 @@ public class NativeCronvoyEngineBuilderImpl extends CronvoyEngineBuilderImpl {
     return this;
   }
 
+  /**
+   * Use a more modern network change API.
+   *
+   * @param enable If true, use the new API; otherwise, don't.
+   */
+  public NativeCronvoyEngineBuilderImpl setUseNetworkChangeEvent(boolean use) {
+    mUseNetworkChangeEvent = use;
+    return this;
+  }
+
   /** Disables the DNS refresh on failure. */
   public NativeCronvoyEngineBuilderImpl
   setDisableDnsRefreshOnFailure(boolean disableDnsRefreshOnFailure) {
@@ -145,6 +134,11 @@ public class NativeCronvoyEngineBuilderImpl extends CronvoyEngineBuilderImpl {
   public NativeCronvoyEngineBuilderImpl
   setDisableDnsRefreshOnNetworkChange(boolean disableDnsRefreshOnNetworkChange) {
     mDisableDnsRefreshOnNetworkChange = disableDnsRefreshOnNetworkChange;
+    return this;
+  }
+
+  public NativeCronvoyEngineBuilderImpl setUseV2NetworkMonitor(boolean useV2NetworkMonitor) {
+    mUseV2NetworkMonitor = useV2NetworkMonitor;
     return this;
   }
 
@@ -277,9 +271,9 @@ public class NativeCronvoyEngineBuilderImpl extends CronvoyEngineBuilderImpl {
 
   EnvoyEngine createEngine(EnvoyOnEngineRunning onEngineRunning, EnvoyLogger envoyLogger,
                            String logLevel) {
-    AndroidEngineImpl engine = new AndroidEngineImpl(getContext(), onEngineRunning, envoyLogger,
-                                                     mEnvoyEventTracker, mEnableProxying);
-    AndroidNetworkMonitor.load(getContext(), engine);
+    AndroidEngineImpl engine = new AndroidEngineImpl(
+        getContext(), onEngineRunning, envoyLogger, mEnvoyEventTracker, mEnableProxying,
+        mUseNetworkChangeEvent, mDisableDnsRefreshOnNetworkChange, mUseV2NetworkMonitor);
     engine.runWithConfig(createEnvoyConfiguration(), logLevel);
     return engine;
   }
@@ -294,13 +288,13 @@ public class NativeCronvoyEngineBuilderImpl extends CronvoyEngineBuilderImpl {
         mDnsRefreshSeconds, mDnsFailureRefreshSecondsBase, mDnsFailureRefreshSecondsMax,
         mDnsQueryTimeoutSeconds, mDnsMinRefreshSeconds, mDnsPreresolveHostnames, mEnableDNSCache,
         mDnsCacheSaveIntervalSeconds, mDnsNumRetries.orElse(-1), mEnableDrainPostDnsRefresh,
-        quicEnabled(), mUseCares, quicConnectionOptions(), quicClientConnectionOptions(),
-        quicHints(), quicCanonicalSuffixes(), mEnableGzipDecompression, brotliEnabled(),
+        quicEnabled(), quicConnectionOptions(), quicClientConnectionOptions(), quicHints(),
+        quicCanonicalSuffixes(), mEnableGzipDecompression, brotliEnabled(),
         numTimeoutsToTriggerPortMigration(), mEnableSocketTag, mEnableInterfaceBinding,
         mH2ConnectionKeepaliveIdleIntervalMilliseconds, mH2ConnectionKeepaliveTimeoutSeconds,
         mMaxConnectionsPerHost, mStreamIdleTimeoutSeconds, mPerTryIdleTimeoutSeconds, mAppVersion,
         mAppId, mTrustChainVerification, nativeFilterChain, platformFilterChain, stringAccessors,
         keyValueStores, mRuntimeGuards, mEnablePlatformCertificatesValidation, mUpstreamTlsSni,
-        mCaresFallbackResolvers, mH3ConnectionKeepaliveInitialIntervalMilliseconds);
+        mH3ConnectionKeepaliveInitialIntervalMilliseconds);
   }
 }

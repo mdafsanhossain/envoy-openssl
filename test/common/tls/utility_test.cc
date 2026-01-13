@@ -60,6 +60,52 @@ TEST(UtilityTest, TestDnsNameMatching) {
   EXPECT_FALSE(Utility::dnsNameMatch("lyft.com", ""));
 }
 
+TEST(UtilityTest, TestOtherNameUniversalWithEmbeddedNull) {
+  // Universal strings are utf-32.
+  uint32_t utf32_data[] = {
+      htonl('t'), htonl('e'), htonl('s'), htonl('t'), 0 /* embedded null */, htonl('s'), htonl('t'),
+      htonl('r'), htonl('i'), htonl('n'), htonl('g'),
+  };
+  ASN1_STRING* asn1_str = ASN1_UNIVERSALSTRING_new();
+  ASN1_STRING_set(asn1_str, utf32_data, sizeof(utf32_data));
+  GENERAL_NAME* name = GENERAL_NAME_new();
+  ASN1_OBJECT* oid = OBJ_txt2obj("1.2.3.4.5", 1);
+  ASN1_TYPE* type = ASN1_TYPE_new();
+  ASN1_TYPE_set(type, V_ASN1_UNIVERSALSTRING, asn1_str);
+  GENERAL_NAME_set0_othername(name, oid, type);
+
+  std::string expected = "test";
+  expected += '\0';
+  expected += "string";
+
+  EXPECT_EQ(Utility::generalNameAsString(name), expected);
+
+  GENERAL_NAME_free(name);
+}
+
+TEST(UtilityTest, TestOtherNameBmpWithEmbeddedNull) {
+  // `BMP` strings are utf-16.
+  uint16_t utf16_data[] = {
+      htons('t'), htons('e'), htons('s'), htons('t'), 0 /* embedded null */, htons('s'), htons('t'),
+      htons('r'), htons('i'), htons('n'), htons('g'),
+  };
+  ASN1_STRING* asn1_str = ASN1_BMPSTRING_new();
+  ASN1_STRING_set(asn1_str, utf16_data, sizeof(utf16_data));
+  GENERAL_NAME* name = GENERAL_NAME_new();
+  ASN1_OBJECT* oid = OBJ_txt2obj("1.2.3.4.5", 1);
+  ASN1_TYPE* type = ASN1_TYPE_new();
+  ASN1_TYPE_set(type, V_ASN1_BMPSTRING, asn1_str);
+  GENERAL_NAME_set0_othername(name, oid, type);
+
+  std::string expected = "test";
+  expected += '\0';
+  expected += "string";
+
+  EXPECT_EQ(Utility::generalNameAsString(name), expected);
+
+  GENERAL_NAME_free(name);
+}
+
 TEST(UtilityTest, TestGetSubjectAlternateNamesWithDNS) {
   bssl::UniquePtr<X509> cert = readCertFromFile(
       TestEnvironment::substitute("{{ test_rundir }}/test/common/tls/test_data/san_dns_cert.pem"));
@@ -133,6 +179,27 @@ TEST(UtilityTest, TestGetSerialNumber) {
   bssl::UniquePtr<X509> cert = readCertFromFile(
       TestEnvironment::substitute("{{ test_rundir }}/test/common/tls/test_data/san_dns_cert.pem"));
   EXPECT_EQ(TEST_SAN_DNS_CERT_SERIAL, Utility::getSerialNumberFromCertificate(*cert));
+}
+
+TEST(UtilityTest, TestExpirationWithUnixTimeWithExpiredCert) {
+  bssl::UniquePtr<X509> cert = readCertFromFile(
+      TestEnvironment::substitute("{{ test_rundir }}/test/common/tls/test_data/san_dns_cert.pem"));
+  // Set a known date (2033-05-18 03:33:20 UTC) so that we get fixed output from this test.
+  const time_t known_date_time = 2000000000;
+  Event::SimulatedTimeSystem time_source;
+  time_source.setSystemTime(std::chrono::system_clock::from_time_t(known_date_time));
+
+  EXPECT_EQ(1787339644, Utility::getExpirationUnixTime(cert.get()).count());
+}
+
+TEST(UtilityTest, TestExpirationWithUnixTimeWithNotExpiredCert) {
+  bssl::UniquePtr<X509> cert = readCertFromFile(
+      TestEnvironment::substitute("{{ test_rundir }}/test/common/tls/test_data/san_dns_cert.pem"));
+  const time_t known_date_time = 0;
+  Event::SimulatedTimeSystem time_source;
+  time_source.setSystemTime(std::chrono::system_clock::from_time_t(known_date_time));
+
+  EXPECT_EQ(1787339644, Utility::getExpirationUnixTime(cert.get()).count());
 }
 
 TEST(UtilityTest, TestDaysUntilExpiration) {

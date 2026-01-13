@@ -38,7 +38,7 @@ absl::string_view getScheme(absl::string_view forwarded_proto, bool is_ssl) {
 } // namespace
 std::string ConnectionManagerUtility::determineNextProtocol(Network::Connection& connection,
                                                             const Buffer::Instance& data) {
-  const std::string next_protocol = connection.nextProtocol();
+  std::string next_protocol = connection.nextProtocol();
   if (!next_protocol.empty()) {
     return next_protocol;
   }
@@ -325,7 +325,11 @@ void ConnectionManagerUtility::cleanInternalHeaders(
     request_headers.removeEnvoyDecoratorOperation();
     request_headers.removeEnvoyDownstreamServiceCluster();
     request_headers.removeEnvoyDownstreamServiceNode();
+
+    // TODO(wbpcode): Envoy may should always remove these headers from client because
+    // these headers are hop by hop headers and should not be sent to upstream.
     request_headers.removeEnvoyOriginalPath();
+    request_headers.removeEnvoyOriginalHost();
   }
 
   // Headers to be stripped from edge *and* intermediate-hop external requests.
@@ -377,10 +381,11 @@ Tracing::Reason ConnectionManagerUtility::mutateTracingRequestHeader(
   const envoy::type::v3::FractionalPercent* overall_sampling =
       &config.tracingConfig()->overall_sampling_;
 
-  if (route && route->tracingConfig()) {
-    client_sampling = &route->tracingConfig()->getClientSampling();
-    random_sampling = &route->tracingConfig()->getRandomSampling();
-    overall_sampling = &route->tracingConfig()->getOverallSampling();
+  const Router::RouteTracing* route_tracing = route ? route->tracingConfig() : nullptr;
+  if (route_tracing != nullptr) {
+    client_sampling = &route_tracing->getClientSampling();
+    random_sampling = &route_tracing->getRandomSampling();
+    overall_sampling = &route_tracing->getOverallSampling();
   }
 
   // Do not apply tracing transformations if we are currently tracing.

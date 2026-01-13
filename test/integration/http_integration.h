@@ -145,7 +145,6 @@ public:
   ~HttpIntegrationTest() override;
 
   void initialize() override;
-  void setupHttp1ImplOverrides(Http1ParserImpl http1_implementation);
   void setupHttp2ImplOverrides(Http2Impl http2_implementation);
 
 protected:
@@ -349,8 +348,6 @@ protected:
   std::string downstreamProtocolStatsRoot() const;
   // Return the upstream protocol part of the stats root.
   std::string upstreamProtocolStatsRoot() const;
-  // Prefix listener stat with IP:port, including IP version dependent loopback address.
-  std::string listenerStatPrefix(const std::string& stat_name);
 
   Network::UpstreamTransportSocketFactoryPtr quic_transport_socket_factory_;
   // Must outlive |codec_client_| because it may not close connection till the end of its life
@@ -393,10 +390,12 @@ public:
       : HttpIntegrationTest(Http::CodecType::HTTP2, version) {}
 
 protected:
+  void startHttp2Session(const Http2Frame& settings);
   void startHttp2Session();
   Http2Frame readFrame();
   void sendFrame(const Http2Frame& frame);
   virtual void beginSession();
+  virtual void beginSession(const Http2Frame& settings);
 
   IntegrationTcpClientPtr tcp_client_;
 };

@@ -94,8 +94,8 @@ ExternalProcessingFilterConfig::createFilterFactoryFromProtoTyped(
   if (proto_config.has_grpc_service()) {
     return [filter_config = std::move(filter_config), &context,
             dual_info](Http::FilterChainFactoryCallbacks& callbacks) {
-      auto client = std::make_unique<ExternalProcessorClientImpl>(
-          context.clusterManager().grpcAsyncClientManager(), dual_info.scope);
+      auto client = createExternalProcessorClient(context.clusterManager().grpcAsyncClientManager(),
+                                                  dual_info.scope);
       callbacks.addStreamFilter(
           Http::StreamFilterSharedPtr{std::make_shared<Filter>(filter_config, std::move(client))});
     };
@@ -112,8 +112,11 @@ ExternalProcessingFilterConfig::createFilterFactoryFromProtoTyped(
 absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
 ExternalProcessingFilterConfig::createRouteSpecificFilterConfigTyped(
     const envoy::extensions::filters::http::ext_proc::v3::ExtProcPerRoute& proto_config,
-    Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&) {
-  return std::make_shared<FilterConfigPerRoute>(proto_config);
+    Server::Configuration::ServerFactoryContext& server_context,
+    ProtobufMessage::ValidationVisitor&) {
+  return std::make_shared<FilterConfigPerRoute>(
+      proto_config, Envoy::Extensions::Filters::Common::Expr::getBuilder(server_context),
+      server_context);
 }
 
 // This method will only be called when the filter is in downstream.
@@ -139,7 +142,7 @@ ExternalProcessingFilterConfig::createFilterFactoryFromProtoWithServerContextTyp
   if (proto_config.has_grpc_service()) {
     return [filter_config = std::move(filter_config),
             &server_context](Http::FilterChainFactoryCallbacks& callbacks) {
-      auto client = std::make_unique<ExternalProcessorClientImpl>(
+      auto client = createExternalProcessorClient(
           server_context.clusterManager().grpcAsyncClientManager(), server_context.scope());
       callbacks.addStreamFilter(
           Http::StreamFilterSharedPtr{std::make_shared<Filter>(filter_config, std::move(client))});

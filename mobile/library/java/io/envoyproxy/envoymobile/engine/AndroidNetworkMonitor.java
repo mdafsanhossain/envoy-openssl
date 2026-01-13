@@ -11,6 +11,7 @@ import android.net.ConnectivityManager.NetworkCallback;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkInfo;
+import android.os.Build;
 import android.telephony.TelephonyManager;
 
 import androidx.annotation.NonNull;
@@ -40,7 +41,7 @@ public class AndroidNetworkMonitor {
   private static volatile AndroidNetworkMonitor instance = null;
   private ConnectivityManager connectivityManager;
 
-  public static void load(Context context, EnvoyEngine envoyEngine) {
+  public static void load(Context context, EnvoyEngine envoyEngine, boolean useNetworkChangeEvent) {
     if (instance != null) {
       return;
     }
@@ -49,7 +50,7 @@ public class AndroidNetworkMonitor {
       if (instance != null) {
         return;
       }
-      instance = new AndroidNetworkMonitor(context, envoyEngine);
+      instance = new AndroidNetworkMonitor(context, envoyEngine, useNetworkChangeEvent);
     }
   }
 
@@ -72,11 +73,14 @@ public class AndroidNetworkMonitor {
 
     private final EnvoyEngine envoyEngine;
     private final ConnectivityManager connectivityManager;
+    private final boolean useNetworkChangeEvent;
     @VisibleForTesting List<Integer> previousTransportTypes = new ArrayList<>();
 
-    DefaultNetworkCallback(EnvoyEngine envoyEngine, ConnectivityManager connectivityManager) {
+    DefaultNetworkCallback(EnvoyEngine envoyEngine, ConnectivityManager connectivityManager,
+                           boolean useNetworkChangeEvent) {
       this.envoyEngine = envoyEngine;
       this.connectivityManager = connectivityManager;
+      this.useNetworkChangeEvent = useNetworkChangeEvent;
     }
 
     @Override
@@ -91,7 +95,7 @@ public class AndroidNetworkMonitor {
       // `onCapabilities` is guaranteed to be called immediately after `onAvailable`
       // starting with Android O, so this logic may not work on older Android versions.
       // https://developer.android.com/reference/android/net/ConnectivityManager.NetworkCallback#onCapabilitiesChanged(android.net.Network,%20android.net.NetworkCapabilities)
-      if (previousTransportTypes.isEmpty()) {
+      if (previousTransportTypes.isEmpty() || useNetworkChangeEvent) {
         // The network was lost previously, see `onLost`.
         onDefaultNetworkChanged(network, networkCapabilities);
       } else {
@@ -170,13 +174,18 @@ public class AndroidNetworkMonitor {
         if (networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
           networkType |= EnvoyNetworkType.GENERIC.getValue();
         }
-        envoyEngine.onDefaultNetworkChanged(networkType);
+        if (useNetworkChangeEvent) {
+          envoyEngine.onDefaultNetworkChangeEvent(networkType);
+        } else {
+          envoyEngine.onDefaultNetworkChanged(networkType);
+        }
       }
       previousTransportTypes = getTransportTypes(networkCapabilities);
     }
   }
 
-  private AndroidNetworkMonitor(Context context, EnvoyEngine envoyEngine) {
+  private AndroidNetworkMonitor(Context context, EnvoyEngine envoyEngine,
+                                boolean useNetworkChangeEvent) {
     int permission =
         ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_NETWORK_STATE);
     if (permission == PackageManager.PERMISSION_DENIED) {
@@ -190,8 +199,10 @@ public class AndroidNetworkMonitor {
 
     connectivityManager =
         (ConnectivityManager)context.getSystemService(Context.CONNECTIVITY_SERVICE);
-    connectivityManager.registerDefaultNetworkCallback(
-        new DefaultNetworkCallback(envoyEngine, connectivityManager));
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+      connectivityManager.registerDefaultNetworkCallback(
+          new DefaultNetworkCallback(envoyEngine, connectivityManager, useNetworkChangeEvent));
+    }
   }
 
   /** @returns The singleton instance of {@link AndroidNetworkMonitor}. */

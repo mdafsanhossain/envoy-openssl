@@ -32,6 +32,7 @@ constexpr absl::string_view Scheme = "scheme";
 constexpr absl::string_view Method = "method";
 constexpr absl::string_view Referer = "referer";
 constexpr absl::string_view Headers = "headers";
+constexpr absl::string_view HeadersBytes = "headers_bytes";
 constexpr absl::string_view Time = "time";
 constexpr absl::string_view ID = "id";
 constexpr absl::string_view UserAgent = "useragent";
@@ -87,6 +88,7 @@ constexpr absl::string_view UpstreamLocality = "locality";
 constexpr absl::string_view UpstreamTransportFailureReason = "transport_failure_reason";
 constexpr absl::string_view UpstreamRequestAttemptCount = "request_attempt_count";
 constexpr absl::string_view UpstreamConnectionPoolReadyDuration = "cx_pool_ready_duration";
+constexpr absl::string_view UpstreamNumEndpoints = "num_endpoints";
 
 // xDS configuration context properties
 constexpr absl::string_view XDS = "xds";
@@ -97,6 +99,7 @@ constexpr absl::string_view RouteMetadata = "route_metadata";
 constexpr absl::string_view VirtualHostName = "virtual_host_name";
 constexpr absl::string_view VirtualHostMetadata = "virtual_host_metadata";
 constexpr absl::string_view UpstreamHostMetadata = "upstream_host_metadata";
+constexpr absl::string_view UpstreamHostLocalityMetadata = "upstream_host_locality_metadata";
 constexpr absl::string_view FilterChainName = "filter_chain_name";
 constexpr absl::string_view ListenerMetadata = "listener_metadata";
 constexpr absl::string_view ListenerDirection = "listener_direction";
@@ -227,7 +230,7 @@ public:
   }
 
 protected:
-  ProtobufWkt::Arena& arena_;
+  Protobuf::Arena& arena_;
 };
 
 class RequestWrapper : public BaseWrapper {

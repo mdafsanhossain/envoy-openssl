@@ -23,6 +23,7 @@
 #include "source/common/common/logger.h"
 #include "source/common/config/well_known_names.h"
 #include "source/common/http/filter_manager.h"
+#include "source/common/router/upstream_to_downstream_impl_base.h"
 #include "source/common/stream_info/stream_info_impl.h"
 #include "source/common/tracing/null_span_impl.h"
 #include "source/extensions/filters/http/common/factory_base.h"
@@ -64,7 +65,7 @@ class UpstreamCodecFilter;
  *
  */
 class UpstreamRequest : public Logger::Loggable<Logger::Id::router>,
-                        public UpstreamToDownstream,
+                        public UpstreamToDownstreamImplBase,
                         public LinkedObject<UpstreamRequest>,
                         public GenericConnectionPoolCallbacks,
                         public Event::DeferredDeletable {
@@ -143,7 +144,6 @@ public:
   };
 
   void readEnable();
-  void encodeBodyAndTrailers();
 
   // Getters and setters
   Upstream::HostDescriptionOptConstRef upstreamHost() {
@@ -168,6 +168,8 @@ public:
   // Exposes streamInfo for the upstream stream.
   StreamInfo::StreamInfo& streamInfo() { return stream_info_; }
   bool hadUpstream() const { return had_upstream_; }
+  // Disable per-try timeouts for websocket upgrades after successful handshake
+  void disablePerTryTimeoutForWebsocketUpgrade();
 
 private:
   friend class UpstreamFilterManager;
@@ -181,8 +183,9 @@ private:
   // queuing.
   void recordConnectionPoolCallbackLatency();
 
-  void addResponseHeadersSize(uint64_t size) {
+  void addResponseHeadersStat(uint64_t size, size_t count) {
     response_headers_size_ = response_headers_size_.value_or(0) + size;
+    response_headers_count_ = response_headers_count_.value_or(0) + count;
   }
   void resetPerTryIdleTimer();
   void onPerTryTimeout();
@@ -203,7 +206,8 @@ private:
   const MonotonicTime start_time_;
   // This is wrapped in an optional, since we want to avoid computing zero size headers when in
   // reality we just didn't get a response back.
-  absl::optional<uint64_t> response_headers_size_{};
+  absl::optional<uint64_t> response_headers_size_;
+  absl::optional<size_t> response_headers_count_;
   // Copies of upstream headers/trailers. These are only set if upstream
   // access logging is configured.
   Http::ResponseHeaderMapPtr upstream_headers_;
@@ -340,7 +344,7 @@ public:
   void disarmRequestTimeout() override {}
   void resetIdleTimer() override {}
   void onLocalReply(Http::Code) override {}
-  void sendGoAwayAndClose() override {}
+  void sendGoAwayAndClose(bool graceful [[maybe_unused]] = false) override {}
   // Upgrade filter chains not supported.
   const Router::RouteEntry::UpgradeMap* upgradeMap() override { return nullptr; }
 
@@ -367,6 +371,9 @@ public:
   void setPausedForWebsocketUpgrade(bool value) override {
     upstream_request_.paused_for_websocket_ = value;
   }
+
+  void disableRouteTimeoutForWebsocketUpgrade() override;
+  void disablePerTryTimeoutForWebsocketUpgrade() override;
 
   const Http::ConnectionPool::Instance::StreamOptions& upstreamStreamOptions() const override {
     return upstream_request_.upstreamStreamOptions();

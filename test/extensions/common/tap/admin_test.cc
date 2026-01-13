@@ -156,14 +156,9 @@ public:
   MockTapSinkFactory() = default;
   ~MockTapSinkFactory() override = default;
 
-  MOCK_METHOD(SinkPtr, createHttpSinkPtr,
-              (const Protobuf::Message& config, Server::Configuration::FactoryContext&),
+  MOCK_METHOD(SinkPtr, createSinkPtr,
+              (const Protobuf::Message& config, Server::Configuration::GenericFactoryContext&),
               (override));
-  MOCK_METHOD(SinkPtr, createTransportSinkPtr,
-              (const Protobuf::Message& config,
-               Server::Configuration::TransportSocketFactoryContext&),
-              (override));
-
   MOCK_METHOD(std::string, name, (), (const, override));
   MOCK_METHOD(ProtobufTypes::MessagePtr, createEmptyConfigProto, (), (override));
 };
@@ -171,10 +166,12 @@ public:
 class TestConfigImpl : public TapConfigBaseImpl {
 public:
   TestConfigImpl(const envoy::config::tap::v3::TapConfig& proto_config,
-                 Extensions::Common::Tap::Sink* admin_streamer, SinkContext context)
+                 Extensions::Common::Tap::Sink* admin_streamer,
+                 Server::Configuration::GenericFactoryContext& context)
       : TapConfigBaseImpl(std::move(proto_config), admin_streamer, context) {}
 };
-TEST(TypedExtensionConfigTest, AddTestConfigHttpContext) {
+
+TEST(TypedExtensionConfigTest, AddTestConfig) {
   const std::string tap_config_yaml =
       R"EOF(
   match:
@@ -193,18 +190,17 @@ TEST(TypedExtensionConfigTest, AddTestConfigHttpContext) {
   MockTapSinkFactory factory_impl;
   EXPECT_CALL(factory_impl, name).Times(AtLeast(1));
   EXPECT_CALL(factory_impl, createEmptyConfigProto)
-      .WillRepeatedly(Invoke([]() -> ProtobufTypes::MessagePtr {
-        return std::make_unique<ProtobufWkt::StringValue>();
-      }));
-  EXPECT_CALL(factory_impl, createHttpSinkPtr(_, _));
+      .WillRepeatedly(Invoke(
+          []() -> ProtobufTypes::MessagePtr { return std::make_unique<Protobuf::StringValue>(); }));
+  EXPECT_CALL(factory_impl, createSinkPtr(_, _));
 
   Registry::InjectFactory<TapSinkFactory> factory(factory_impl);
 
-  NiceMock<Server::Configuration::MockFactoryContext> factory_context;
+  NiceMock<Server::Configuration::MockGenericFactoryContext> factory_context;
   TestConfigImpl(tap_config, nullptr, factory_context);
 }
 
-TEST(TypedExtensionConfigTest, AddTestConfigTransportSocketContext) {
+TEST(TypedExtensionConfigTest, AddTestConfigForMinStreamedSentBytes) {
   const std::string tap_config_yaml =
       R"EOF(
   match:
@@ -216,6 +212,8 @@ TEST(TypedExtensionConfigTest, AddTestConfigTransportSocketContext) {
           name: custom_sink
           typed_config:
             "@type": type.googleapis.cm/google.protobuf.StringValue
+    streaming: true
+    min_streamed_sent_bytes: 1400
 )EOF";
   envoy::config::tap::v3::TapConfig tap_config;
   TestUtility::loadFromYaml(tap_config_yaml, tap_config);
@@ -223,15 +221,17 @@ TEST(TypedExtensionConfigTest, AddTestConfigTransportSocketContext) {
   MockTapSinkFactory factory_impl;
   EXPECT_CALL(factory_impl, name).Times(AtLeast(1));
   EXPECT_CALL(factory_impl, createEmptyConfigProto)
-      .WillRepeatedly(Invoke([]() -> ProtobufTypes::MessagePtr {
-        return std::make_unique<ProtobufWkt::StringValue>();
-      }));
-  EXPECT_CALL(factory_impl, createTransportSinkPtr(_, _));
+      .WillRepeatedly(Invoke(
+          []() -> ProtobufTypes::MessagePtr { return std::make_unique<Protobuf::StringValue>(); }));
+  EXPECT_CALL(factory_impl, createSinkPtr(_, _));
 
   Registry::InjectFactory<TapSinkFactory> factory(factory_impl);
 
-  NiceMock<Server::Configuration::MockTransportSocketFactoryContext> factory_context;
-  TestConfigImpl(tap_config, nullptr, factory_context);
+  NiceMock<Server::Configuration::MockGenericFactoryContext> factory_context;
+  // Trigger construct function for min_streamed_sent_bytes_
+  auto test_config_Impl_ptr =
+      std::make_unique<TestConfigImpl>(tap_config, nullptr, factory_context);
+  EXPECT_EQ(test_config_Impl_ptr->minStreamedSentBytes(), 1400);
 }
 
 // Validates that a BufferedAdmin tap config that is passed without an admin
@@ -251,12 +251,11 @@ TEST(TypedExtensionConfigTest, BufferedAdminNoAdminStreamerRejected) {
   MockTapSinkFactory factory_impl;
   EXPECT_CALL(factory_impl, name).Times(AtLeast(1));
   EXPECT_CALL(factory_impl, createEmptyConfigProto)
-      .WillRepeatedly(Invoke([]() -> ProtobufTypes::MessagePtr {
-        return std::make_unique<ProtobufWkt::StringValue>();
-      }));
+      .WillRepeatedly(Invoke(
+          []() -> ProtobufTypes::MessagePtr { return std::make_unique<Protobuf::StringValue>(); }));
   Registry::InjectFactory<TapSinkFactory> factory(factory_impl);
 
-  NiceMock<Server::Configuration::MockTransportSocketFactoryContext> factory_context;
+  NiceMock<Server::Configuration::MockGenericFactoryContext> factory_context;
   EXPECT_THROW_WITH_MESSAGE(
       TestConfigImpl(tap_config, nullptr, factory_context), EnvoyException,
       "Output sink type BufferedAdmin requires that the admin output will be configured via admin");
@@ -279,12 +278,11 @@ TEST(TypedExtensionConfigTest, StreamingAdminNoAdminStreamerRejected) {
   MockTapSinkFactory factory_impl;
   EXPECT_CALL(factory_impl, name).Times(AtLeast(1));
   EXPECT_CALL(factory_impl, createEmptyConfigProto)
-      .WillRepeatedly(Invoke([]() -> ProtobufTypes::MessagePtr {
-        return std::make_unique<ProtobufWkt::StringValue>();
-      }));
+      .WillRepeatedly(Invoke(
+          []() -> ProtobufTypes::MessagePtr { return std::make_unique<Protobuf::StringValue>(); }));
   Registry::InjectFactory<TapSinkFactory> factory(factory_impl);
 
-  NiceMock<Server::Configuration::MockTransportSocketFactoryContext> factory_context;
+  NiceMock<Server::Configuration::MockGenericFactoryContext> factory_context;
   EXPECT_THROW_WITH_MESSAGE(TestConfigImpl(tap_config, nullptr, factory_context), EnvoyException,
                             "Output sink type StreamingAdmin requires that the admin output will "
                             "be configured via admin");
@@ -361,6 +359,8 @@ TEST_F(AdminHandlerTest, CloseMidStream) {
   // Direct access to the handle is required so we can submit traces directly
   PerTapSinkHandlePtr sinkHandle =
       handler_->createPerTapSinkHandle(0, ProtoOutputSink::OutputSinkTypeCase::kStreamingAdmin);
+
+  EXPECT_EQ(nullptr, attachedRequest()->traceBuffer());
 
   EXPECT_CALL(main_thread_dispatcher_, post(_)).Times(2);
   main_thread_dispatcher_.post([this] { attachedRequest().reset(); });

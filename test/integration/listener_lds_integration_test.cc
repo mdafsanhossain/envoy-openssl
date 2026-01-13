@@ -8,6 +8,7 @@
 #include "envoy/network/connection.h"
 #include "envoy/service/discovery/v3/discovery.pb.h"
 
+#include "source/common/common/random_generator.h"
 #include "source/common/config/api_version.h"
 
 #include "test/common/grpc/grpc_client_integration.h"
@@ -171,7 +172,7 @@ public:
                        const std::string& version) {
     envoy::service::discovery::v3::DiscoveryResponse response;
     response.set_version_info(version);
-    response.set_type_url(Config::TypeUrl::get().Listener);
+    response.set_type_url(Config::TestTypeUrl::get().Listener);
     for (const auto& listener_config : listener_configs) {
       response.add_resources()->PackFrom(listener_config);
     }
@@ -193,7 +194,7 @@ public:
   void sendRdsResponse(const std::string& route_config, const std::string& version) {
     envoy::service::discovery::v3::DiscoveryResponse response;
     response.set_version_info(version);
-    response.set_type_url(Config::TypeUrl::get().RouteConfiguration);
+    response.set_type_url(Config::TestTypeUrl::get().RouteConfiguration);
     const auto route_configuration =
         TestUtility::parseYaml<envoy::config::route::v3::RouteConfiguration>(route_config);
     response.add_resources()->PackFrom(route_configuration);
@@ -1222,7 +1223,7 @@ public:
                        const std::string& version) {
     envoy::service::discovery::v3::DiscoveryResponse response;
     response.set_version_info(version);
-    response.set_type_url(Config::TypeUrl::get().Listener);
+    response.set_type_url(Config::TestTypeUrl::get().Listener);
     for (const auto& listener_config : listener_configs) {
       response.add_resources()->PackFrom(listener_config);
     }
@@ -1639,6 +1640,12 @@ TEST_P(ListenerFilterIntegrationTest,
     listener_config_.set_name("listener_foo");
     listener_config_.set_stat_prefix("listener_stat");
     listener_config_.mutable_enable_reuse_port()->set_value(false);
+
+    // Set random port manually for test. 0 port means the kernel will generate a random port
+    // and envoy will skip the port conflict check.
+    const uint32_t random_port = Random::RandomUtility::random() % 10000 + 10000;
+    listener_config_.mutable_address()->mutable_socket_address()->set_port_value(random_port);
+
     ENVOY_LOG_MISC(debug, "listener config: {}", listener_config_.DebugString());
     bootstrap.mutable_static_resources()->mutable_listeners()->Clear();
     auto* lds_config_source = bootstrap.mutable_dynamic_resources()->mutable_lds_config();
@@ -1682,8 +1689,8 @@ TEST_P(ListenerFilterIntegrationTest,
   EXPECT_LOG_CONTAINS(
       "warning",
       "gRPC config for type.googleapis.com/envoy.config.listener.v3.Listener rejected: Error "
-      "adding/updating listener(s) listener_foo: Listener listener_foo: doesn't support update any "
-      "socket options when the reuse port isn't enabled",
+      "adding/updating listener(s) listener_foo: error adding listener: 'listener_foo' has "
+      "duplicate address",
       {
         sendLdsResponse({MessageUtil::getYamlStringFromMessage(listener_config_)}, "2");
         test_server_->waitForCounterGe("listener_manager.lds.update_rejected", 1);
@@ -1732,7 +1739,7 @@ public:
           // link time.
           auto& filter = *src_listener_config.add_listener_filters();
           filter.set_name("envoy.filters.listener.original_dst");
-          filter.mutable_typed_config()->PackFrom(ProtobufWkt::Struct());
+          filter.mutable_typed_config()->PackFrom(Protobuf::Struct());
           auto& virtual_listener_config = *bootstrap.mutable_static_resources()->add_listeners();
           virtual_listener_config = src_listener_config;
           virtual_listener_config.mutable_use_original_dst()->set_value(false);

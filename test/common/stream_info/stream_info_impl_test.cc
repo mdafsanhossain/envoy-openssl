@@ -44,7 +44,7 @@ protected:
         // with --config=docker-msan
         sizeof(stream_info) == 712 ||
         // with --config=docker-clang
-        sizeof(stream_info) == 720 ||
+        sizeof(stream_info) == 736 ||
         // with --config=docker-clang-libc++
         sizeof(stream_info) == 688)
         << "If adding fields to StreamInfoImpl, please check to see if you "
@@ -84,6 +84,10 @@ TEST_F(StreamInfoImplTest, TimingTest) {
   EXPECT_FALSE(timing.firstUpstreamRxByteReceived());
   upstream_timing.onFirstUpstreamRxByteReceived(test_time_.timeSystem());
   dur = checkDuration(dur, timing.firstUpstreamRxByteReceived());
+
+  EXPECT_FALSE(timing.firstUpstreamRxBodyByteReceived());
+  upstream_timing.onFirstUpstreamRxBodyByteReceived(test_time_.timeSystem());
+  dur = checkDuration(dur, timing.firstUpstreamRxBodyByteReceived());
 
   EXPECT_FALSE(timing.lastUpstreamRxByteReceived());
   upstream_timing.onLastUpstreamRxByteReceived(test_time_.timeSystem());
@@ -303,6 +307,9 @@ TEST_F(StreamInfoImplTest, MiscSettersAndGetters) {
     stream_info.setResponseCodeDetails(ResponseCodeDetails::get().ViaUpstream);
     ASSERT_TRUE(stream_info.responseCodeDetails().has_value());
     EXPECT_EQ(ResponseCodeDetails::get().ViaUpstream, stream_info.responseCodeDetails().value());
+    stream_info.setResponseCodeDetails("response code details");
+    ASSERT_TRUE(stream_info.responseCodeDetails().has_value());
+    EXPECT_EQ("response code details", stream_info.responseCodeDetails().value());
 
     EXPECT_FALSE(stream_info.connectionTerminationDetails().has_value());
     stream_info.setConnectionTerminationDetails("access_denied");
@@ -319,6 +326,16 @@ TEST_F(StreamInfoImplTest, MiscSettersAndGetters) {
     EXPECT_TRUE(stream_info.healthCheck());
 
     EXPECT_EQ(nullptr, stream_info.route());
+    EXPECT_EQ(nullptr, stream_info.virtualHost());
+
+    std::shared_ptr<NiceMock<Router::MockVirtualHost>> vhost =
+        std::make_shared<NiceMock<Router::MockVirtualHost>>();
+
+    stream_info.vhost_ = vhost;
+
+    // If the route is invalid then the vhost will be used.
+    EXPECT_EQ(vhost, stream_info.virtualHost());
+
     std::shared_ptr<NiceMock<Router::MockRoute>> route =
         std::make_shared<NiceMock<Router::MockRoute>>();
     stream_info.route_ = route;
@@ -432,6 +449,8 @@ TEST_F(StreamInfoImplTest, SetFrom) {
   s1.setDownstreamTransportFailureReason("error");
   s1.addBytesSent(1);
   s1.setIsShadow(true);
+  s1.addCustomFlag("test_flag");
+  s1.addCustomFlag("test_flag2");
 
 #ifdef __clang__
 #if defined(__linux__)
@@ -488,6 +507,8 @@ TEST_F(StreamInfoImplTest, SetFrom) {
   EXPECT_EQ(s1.getUpstreamBytesMeter(), s2.getUpstreamBytesMeter());
   EXPECT_EQ(s1.bytesSent(), s2.bytesSent());
   EXPECT_EQ(s1.isShadow(), s2.isShadow());
+  EXPECT_EQ(s1.customFlags(), s2.customFlags());
+  EXPECT_EQ("test_flag,test_flag2", s1.customFlags());
 }
 
 TEST_F(StreamInfoImplTest, DynamicMetadataTest) {
@@ -499,8 +520,8 @@ TEST_F(StreamInfoImplTest, DynamicMetadataTest) {
   EXPECT_EQ("test_value",
             Config::Metadata::metadataValue(&stream_info.dynamicMetadata(), "com.test", "test_key")
                 .string_value());
-  ProtobufWkt::Struct struct_obj2;
-  ProtobufWkt::Value val2;
+  Protobuf::Struct struct_obj2;
+  Protobuf::Value val2;
   val2.set_string_value("another_value");
   (*struct_obj2.mutable_fields())["another_key"] = val2;
   stream_info.setDynamicMetadata("com.test", struct_obj2);

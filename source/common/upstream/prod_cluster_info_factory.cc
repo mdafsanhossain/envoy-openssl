@@ -16,15 +16,18 @@ ProdClusterInfoFactory::createClusterInfo(const CreateClusterInfoParams& params)
       params.stats_.createScope(fmt::format("cluster.{}.", params.cluster_.name()));
 
   Envoy::Server::Configuration::TransportSocketFactoryContextImpl factory_context(
-      params.server_context_, params.ssl_context_manager_, *scope,
-      params.server_context_.clusterManager(), params.server_context_.messageValidationVisitor());
+      params.server_context_, *scope, params.server_context_.messageValidationVisitor());
 
   // TODO(JimmyCYJ): Support SDS for HDS cluster.
   Network::UpstreamTransportSocketFactoryPtr socket_factory = THROW_OR_RETURN_VALUE(
       Upstream::createTransportSocketFactory(params.cluster_, factory_context),
       Network::UpstreamTransportSocketFactoryPtr);
+  OptRef<const xds::type::matcher::v3::Matcher> matcher;
+  if (params.cluster_.has_transport_socket_matcher()) {
+    matcher = makeOptRefFromPtr(&params.cluster_.transport_socket_matcher());
+  }
   auto socket_matcher = THROW_OR_RETURN_VALUE(
-      TransportSocketMatcherImpl::create(params.cluster_.transport_socket_matches(),
+      TransportSocketMatcherImpl::create(params.cluster_.transport_socket_matches(), matcher,
                                          factory_context, socket_factory, *scope),
       std::unique_ptr<TransportSocketMatcherImpl>);
 

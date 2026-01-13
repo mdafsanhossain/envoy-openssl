@@ -21,6 +21,7 @@
 #include "source/common/common/assert.h"
 #include "source/common/common/empty_string.h"
 #include "source/common/common/fmt.h"
+#include "source/common/common/matchers.h"
 #include "source/common/common/mutex_tracer_impl.h"
 #include "source/common/common/utility.h"
 #include "source/common/formatter/substitution_formatter.h"
@@ -136,7 +137,7 @@ AdminImpl::AdminImpl(const std::string& profile_path, Server::Instance& server,
                {Admin::ParamDescriptor::Type::String, "mask",
                 "The mask to apply. When both resource and mask are specified, "
                 "the mask is applied to every element in the desired repeated field so that only a "
-                "subset of fields are returned. The mask is parsed as a ProtobufWkt::FieldMask"},
+                "subset of fields are returned. The mask is parsed as a Protobuf::FieldMask"},
                {Admin::ParamDescriptor::Type::String, "name_regex",
                 "Dump only the currently loaded configurations whose names match the specified "
                 "regex. Can be used with both resource and mask query parameters."},
@@ -147,7 +148,7 @@ AdminImpl::AdminImpl(const std::string& profile_path, Server::Instance& server,
                       MAKE_ADMIN_HANDLER(init_dump_handler_.handlerInitDump), false, false,
                       {{Admin::ParamDescriptor::Type::String, "mask",
                         "The desired component to dump unready targets. The mask is parsed as "
-                        "a ProtobufWkt::FieldMask. For example, get the unready targets of "
+                        "a Protobuf::FieldMask. For example, get the unready targets of "
                         "all listeners with /init_dump?mask=listener`"}}),
           makeHandler("/contention", "dump current Envoy mutex contention stats (if enabled)",
                       MAKE_ADMIN_HANDLER(stats_handler_.handlerContention), false, false),
@@ -200,6 +201,9 @@ AdminImpl::AdminImpl(const std::string& profile_path, Server::Instance& server,
                         prepend("", LogsHandler::levelStrings())}}),
           makeHandler("/memory", "print current allocation/heap usage",
                       MAKE_ADMIN_HANDLER(server_info_handler_.handlerMemory), false, false),
+          makeHandler("/memory/tcmalloc", "print TCMalloc stats",
+                      MAKE_ADMIN_HANDLER(server_info_handler_.handleMemoryTcmallocStats), false,
+                      false),
           makeHandler("/quitquitquit", "exit the server",
                       MAKE_ADMIN_HANDLER(server_cmd_handler_.handlerQuitQuitQuit), false, true),
           makeHandler("/reset_counters", "reset all counters to zero",
@@ -314,6 +318,10 @@ bool AdminImpl::createFilterChain(Http::FilterChainManager& manager,
   return true;
 }
 
+void AdminImpl::addAllowlistedPath(Matchers::StringMatcherPtr matcher) {
+  allowlisted_paths_.emplace_back(std::move(matcher));
+}
+
 namespace {
 // Implements a chunked request for static text.
 class StaticTextRequest : public Admin::Request {
@@ -391,6 +399,12 @@ Admin::RequestPtr AdminImpl::makeRequest(AdminStream& admin_stream) const {
   std::string::size_type query_index = path_and_query.find('?');
   if (query_index == std::string::npos) {
     query_index = path_and_query.size();
+  }
+  if (!allowlisted_paths_.empty() && !acceptTargetPath(path_and_query)) {
+    ENVOY_LOG(info, "Request to admin interface path {} is not allowed", path_and_query);
+    Buffer::OwnedImpl error_response;
+    error_response.add(fmt::format("request to path {} not allowed", path_and_query));
+    return Admin::makeStaticTextRequest(error_response, Http::Code::Forbidden);
   }
 
   for (const UrlHandler& handler : handlers_) {

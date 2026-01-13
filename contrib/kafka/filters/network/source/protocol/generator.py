@@ -233,9 +233,9 @@ class StatefulProcessor:
                 fields.append(child)
 
         # Some structures share the same name, use request/response as prefix.
-        if cpp_name in ['Cursor', 'DirectoryData', 'EntityData', 'EntryData', 'PartitionData',
-                        'PartitionSnapshot', 'SnapshotId', 'TopicData', 'TopicPartitions',
-                        'TopicSnapshot']:
+        if cpp_name in ['Cursor', 'DirectoryData', 'EntityData', 'EntryData', 'Listener',
+                        'PartitionData', 'PartitionSnapshot', 'SnapshotId', 'StateBatch',
+                        'TopicData', 'TopicPartitions', 'TopicSnapshot']:
             cpp_name = self.type.capitalize() + type_name
 
         # Some of the types repeat multiple times (e.g. AlterableConfig).
@@ -822,6 +822,7 @@ class RenderingHelper:
         # Templates are resolved relatively to main start script, due to main & test templates being
         # stored in different directories.
         env = jinja2.Environment(
+            autoescape=jinja2.select_autoescape(['html', 'xml']),
             loader=jinja2.FileSystemLoader(
                 searchpath=os.path.dirname(os.path.abspath(sys.argv[0]))))
         env.filters['camel_case_to_snake_case'] = RenderingHelper.camel_case_to_snake_case

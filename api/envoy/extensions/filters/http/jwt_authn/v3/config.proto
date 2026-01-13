@@ -77,17 +77,20 @@ message JwtProvider {
   // It is optional. If specified, it has to match the ``iss`` field in JWT,
   // otherwise the JWT ``iss`` field is not checked.
   //
-  // Note: ``JwtRequirement`` :ref:`allow_missing <envoy_v3_api_field_extensions.filters.http.jwt_authn.v3.JwtRequirement.allow_missing>`
-  // and :ref:`allow_missing_or_failed <envoy_v3_api_field_extensions.filters.http.jwt_authn.v3.JwtRequirement.allow_missing_or_failed>`
-  // are implemented differently than other ``JwtRequirements``. Hence the usage of this field
-  // is different as follows if ``allow_missing`` or ``allow_missing_or_failed`` is used:
+  // .. note::
+  //     ``JwtRequirement`` :ref:`allow_missing <envoy_v3_api_field_extensions.filters.http.jwt_authn.v3.JwtRequirement.allow_missing>`
+  //     and :ref:`allow_missing_or_failed <envoy_v3_api_field_extensions.filters.http.jwt_authn.v3.JwtRequirement.allow_missing_or_failed>`
+  //     are implemented differently than other ``JwtRequirements``. Hence the usage of this field
+  //     is different as follows if ``allow_missing`` or ``allow_missing_or_failed`` is used:
   //
-  // * If a JWT has ``iss`` field, it needs to be specified by this field in one of ``JwtProviders``.
-  // * If a JWT doesn't have ``iss`` field, one of ``JwtProviders`` should fill this field empty.
-  // * Multiple ``JwtProviders`` should not have same value in this field.
+  //     * If a JWT has ``iss`` field, it needs to be specified by this field in one of ``JwtProviders``.
+  //     * If a JWT doesn't have ``iss`` field, one of ``JwtProviders`` should fill this field empty.
+  //     * Multiple ``JwtProviders`` should not have same value in this field.
   //
-  // Example: https://securetoken.google.com
-  // Example: 1234567-compute@developer.gserviceaccount.com
+  // Examples:
+  //
+  // * https://securetoken.google.com
+  // * Example: 1234567-compute@developer.gserviceaccount.com
   //
   string issuer = 1;
 
@@ -689,8 +692,7 @@ message FilterStateRule {
 
   // A map of string keys to requirements. The string key is the string value
   // in the FilterState with the name specified in the ``name`` field above.
-  map<string, JwtRequirement>
-  requires = 3;
+  map<string, JwtRequirement> requires = 3;
 }
 
 // This is the Envoy HTTP filter config for JWT authentication.
@@ -735,7 +737,7 @@ message FilterStateRule {
 //              - provider_name: provider1
 //              - provider_name: provider2
 //
-// [#next-free-field: 7]
+// [#next-free-field: 8]
 message JwtAuthentication {
   option (udpa.annotations.versioning).previous_message_type =
       "envoy.config.filter.http.jwt_authn.v2alpha.JwtAuthentication";
@@ -813,6 +815,9 @@ message JwtAuthentication {
   // in the body along with WWWAuthenticate header value set with "invalid token". If this value is set to true,
   // the response details will be stripped and only a 401 response code will be returned. Default value is false
   bool strip_failure_response = 6;
+
+  // Optional additional prefix to use when emitting statistics.
+  string stat_prefix = 7;
 }
 
 // Specify per-route config.

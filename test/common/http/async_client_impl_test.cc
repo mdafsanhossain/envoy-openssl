@@ -25,6 +25,7 @@
 #include "test/mocks/stats/mocks.h"
 #include "test/mocks/upstream/cluster_manager.h"
 #include "test/test_common/printers.h"
+#include "test/test_common/test_runtime.h"
 
 #include "absl/types/optional.h"
 #include "gmock/gmock.h"
@@ -1020,7 +1021,12 @@ TEST_F(AsyncClientImplTest, Retry) {
   response_decoder_->decodeHeaders(std::move(response_headers2), true);
 }
 
-TEST_F(AsyncClientImplTest, RetryWithStream) {
+TEST_F(AsyncClientImplTest, RetryWithStreamWithLegacyLogic) {
+  // Remove this test when the runtime flag is removed.
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.http_async_client_retry_respect_buffer_limits", "false"}});
+
   ON_CALL(factory_context_.runtime_loader_.snapshot_, featureEnabled("upstream.use_retry", 100))
       .WillByDefault(Return(true));
   Buffer::InstancePtr body{new Buffer::OwnedImpl("test body")};
@@ -1074,7 +1080,12 @@ TEST_F(AsyncClientImplTest, RetryWithStream) {
   dispatcher_.clearDeferredDeleteList();
 }
 
-TEST_F(AsyncClientImplTest, DataBufferForRetryOverflow) {
+TEST_F(AsyncClientImplTest, DataBufferForRetryOverflowWithLegacyLogic) {
+  // Remove this test when the runtime flag is removed.
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.http_async_client_retry_respect_buffer_limits", "false"}});
+
   ON_CALL(factory_context_.runtime_loader_.snapshot_, featureEnabled("upstream.use_retry", 100))
       .WillByDefault(Return(true));
 
@@ -1124,6 +1135,166 @@ TEST_F(AsyncClientImplTest, DataBufferForRetryOverflow) {
   // On retry, data will be empty because it was larger than > 64KB
   Buffer::InstancePtr empty_buffer{new Buffer::OwnedImpl("")};
   EXPECT_CALL(stream_encoder_, encodeData(BufferEqual(empty_buffer.get()), true));
+  timer_->invokeCallback();
+
+  // Normal response.
+  expectResponseHeaders(stream_callbacks_, 200, true);
+  EXPECT_CALL(stream_callbacks_, onComplete());
+  ResponseHeaderMapPtr response_headers2(new TestResponseHeaderMapImpl{{":status", "200"}});
+  response_decoder_->decodeHeaders(std::move(response_headers2), true);
+  dispatcher_.clearDeferredDeleteList();
+}
+
+TEST_F(AsyncClientImplTest, RetryWithStream) {
+  ON_CALL(factory_context_.runtime_loader_.snapshot_, featureEnabled("upstream.use_retry", 100))
+      .WillByDefault(Return(true));
+  Buffer::InstancePtr body{new Buffer::OwnedImpl("test body")};
+
+  EXPECT_CALL(cm_.thread_local_cluster_.conn_pool_, newStream(_, _, _))
+      .WillOnce(Invoke(
+          [&](ResponseDecoder& decoder, ConnectionPool::Callbacks& callbacks,
+              const ConnectionPool::Instance::StreamOptions&) -> ConnectionPool::Cancellable* {
+            callbacks.onPoolReady(stream_encoder_, cm_.thread_local_cluster_.conn_pool_.host_,
+                                  stream_info_, {});
+            response_decoder_ = &decoder;
+            return nullptr;
+          }));
+
+  TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  EXPECT_CALL(stream_encoder_, encodeHeaders(HeaderMapEqualRef(&headers), false));
+  EXPECT_CALL(stream_encoder_, encodeData(BufferStringEqual("test body"), true));
+
+  headers.setReferenceEnvoyRetryOn(Headers::get().EnvoyRetryOnValues._5xx);
+  AsyncClient::Stream* stream = client_.start(stream_callbacks_, {});
+  stream->sendHeaders(headers, false);
+  stream->sendData(*body, true);
+
+  // Expect retry and retry timer create.
+  timer_ = new NiceMock<Event::MockTimer>(&dispatcher_);
+  ResponseHeaderMapPtr response_headers(new TestResponseHeaderMapImpl{{":status", "503"}});
+  response_decoder_->decodeHeaders(std::move(response_headers), true);
+
+  // Retry request.
+  EXPECT_CALL(cm_.thread_local_cluster_.conn_pool_, newStream(_, _, _))
+      .WillOnce(Invoke(
+          [&](ResponseDecoder& decoder, ConnectionPool::Callbacks& callbacks,
+              const ConnectionPool::Instance::StreamOptions&) -> ConnectionPool::Cancellable* {
+            callbacks.onPoolReady(stream_encoder_, cm_.thread_local_cluster_.conn_pool_.host_,
+                                  stream_info_, {});
+            response_decoder_ = &decoder;
+            return nullptr;
+          }));
+
+  EXPECT_CALL(stream_encoder_, encodeHeaders(HeaderMapEqualRef(&headers), false));
+  EXPECT_CALL(stream_encoder_, encodeData(BufferStringEqual("test body"), true));
+  timer_->invokeCallback();
+
+  // Normal response.
+  expectResponseHeaders(stream_callbacks_, 200, true);
+  EXPECT_CALL(stream_callbacks_, onComplete());
+  ResponseHeaderMapPtr response_headers2(new TestResponseHeaderMapImpl{{":status", "200"}});
+  response_decoder_->decodeHeaders(std::move(response_headers2), true);
+  dispatcher_.clearDeferredDeleteList();
+}
+
+TEST_F(AsyncClientImplTest, DataBufferForRetryOverflow) {
+  ON_CALL(factory_context_.runtime_loader_.snapshot_, featureEnabled("upstream.use_retry", 100))
+      .WillByDefault(Return(true));
+
+  EXPECT_CALL(cm_.thread_local_cluster_.conn_pool_, newStream(_, _, _))
+      .WillOnce(Invoke(
+          [&](ResponseDecoder& decoder, ConnectionPool::Callbacks& callbacks,
+              const ConnectionPool::Instance::StreamOptions&) -> ConnectionPool::Cancellable* {
+            callbacks.onPoolReady(stream_encoder_, cm_.thread_local_cluster_.conn_pool_.host_,
+                                  stream_info_, {});
+            response_decoder_ = &decoder;
+            return nullptr;
+          }));
+
+  TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  EXPECT_CALL(stream_encoder_, encodeHeaders(HeaderMapEqualRef(&headers), false));
+
+  // Default buffer limit is 64KB, so make the body just over that.
+
+  // large body must be > 64KB
+  const std::string body_str((1 << 16) + 1, 'a');
+  Buffer::InstancePtr large_body{new Buffer::OwnedImpl(body_str)};
+
+  EXPECT_CALL(stream_encoder_, encodeData(BufferStringEqual(body_str), true));
+
+  headers.setReferenceEnvoyRetryOn(Headers::get().EnvoyRetryOnValues._5xx);
+  AsyncClient::Stream* stream = client_.start(stream_callbacks_, {});
+  stream->sendHeaders(headers, false);
+  stream->sendData(*large_body, true);
+
+  // No retry timer create since body is too large to buffer and the retry will not be attempted.
+  EXPECT_CALL(dispatcher_, createTimer_(_)).Times(0);
+  EXPECT_CALL(cm_.thread_local_cluster_.conn_pool_, newStream(_, _, _)).Times(0);
+  EXPECT_CALL(stream_encoder_, encodeHeaders(_, _)).Times(0);
+
+  // Expect failure response.
+  expectResponseHeaders(stream_callbacks_, 503, true);
+  EXPECT_CALL(stream_callbacks_, onComplete());
+
+  ResponseHeaderMapPtr response_headers(new TestResponseHeaderMapImpl{{":status", "503"}});
+  response_decoder_->decodeHeaders(std::move(response_headers), true);
+
+  dispatcher_.clearDeferredDeleteList();
+}
+
+TEST_F(AsyncClientImplTest, DataBufferForRetryWithLargerBufferLimit) {
+  ON_CALL(factory_context_.runtime_loader_.snapshot_, featureEnabled("upstream.use_retry", 100))
+      .WillByDefault(Return(true));
+
+  EXPECT_CALL(cm_.thread_local_cluster_.conn_pool_, newStream(_, _, _))
+      .WillOnce(Invoke(
+          [&](ResponseDecoder& decoder, ConnectionPool::Callbacks& callbacks,
+              const ConnectionPool::Instance::StreamOptions&) -> ConnectionPool::Cancellable* {
+            callbacks.onPoolReady(stream_encoder_, cm_.thread_local_cluster_.conn_pool_.host_,
+                                  stream_info_, {});
+            response_decoder_ = &decoder;
+            return nullptr;
+          }));
+
+  TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  EXPECT_CALL(stream_encoder_, encodeHeaders(HeaderMapEqualRef(&headers), false));
+
+  // Default buffer limit is 64KB, so make the body just over that.
+
+  // large body must be > 64KB
+  const std::string body_str((1 << 16) + 1, 'a');
+  Buffer::InstancePtr large_body{new Buffer::OwnedImpl(body_str)};
+
+  EXPECT_CALL(stream_encoder_, encodeData(BufferStringEqual(body_str), true));
+
+  headers.setReferenceEnvoyRetryOn(Headers::get().EnvoyRetryOnValues._5xx);
+  // Set buffer limit to larger than body size.
+  AsyncClient::Stream* stream =
+      client_.start(stream_callbacks_, AsyncClient::StreamOptions().setBufferLimit((1 << 16) + 2));
+  stream->sendHeaders(headers, false);
+  stream->sendData(*large_body, true);
+
+  // Expect retry and retry timer create.
+  timer_ = new NiceMock<Event::MockTimer>(&dispatcher_);
+  ResponseHeaderMapPtr response_headers(new TestResponseHeaderMapImpl{{":status", "503"}});
+  response_decoder_->decodeHeaders(std::move(response_headers), true);
+
+  // Retry request.
+  EXPECT_CALL(cm_.thread_local_cluster_.conn_pool_, newStream(_, _, _))
+      .WillOnce(Invoke(
+          [&](ResponseDecoder& decoder, ConnectionPool::Callbacks& callbacks,
+              const ConnectionPool::Instance::StreamOptions&) -> ConnectionPool::Cancellable* {
+            callbacks.onPoolReady(stream_encoder_, cm_.thread_local_cluster_.conn_pool_.host_,
+                                  stream_info_, {});
+            response_decoder_ = &decoder;
+            return nullptr;
+          }));
+
+  EXPECT_CALL(stream_encoder_, encodeHeaders(HeaderMapEqualRef(&headers), false));
+  EXPECT_CALL(stream_encoder_, encodeData(BufferStringEqual(body_str), true));
   timer_->invokeCallback();
 
   // Normal response.
@@ -2204,7 +2375,7 @@ TEST_F(AsyncClientImplTest, RdsGettersTest) {
   auto& path_match_criterion = route_entry->pathMatchCriterion();
   EXPECT_EQ("", path_match_criterion.matcher());
   EXPECT_EQ(Router::PathMatchType::None, path_match_criterion.matchType());
-  const auto& route_config = route->virtualHost().routeConfig();
+  const auto& route_config = route->virtualHost()->routeConfig();
   EXPECT_EQ("", route_config.name());
   EXPECT_EQ(0, route_config.internalOnlyHeaders().size());
   auto cluster_info = filter_callbacks->clusterInfo();
@@ -2238,6 +2409,73 @@ TEST_F(AsyncClientImplTest, ParentStreamInfo) {
   EXPECT_FALSE(stream->streamInfo().parentStreamInfo().has_value());
 }
 
+TEST_F(AsyncClientImplTest, MetadataMatchCriteriaWithNullRoute) {
+  NiceMock<StreamInfo::MockStreamInfo> parent_stream_info;
+  EXPECT_CALL(parent_stream_info, route()).WillRepeatedly(Return(nullptr));
+
+  auto options = AsyncClient::StreamOptions();
+  options.parent_context.stream_info = &parent_stream_info;
+
+  // Start the client - this should not crash
+  AsyncClient::Stream* stream = client_.start(stream_callbacks_, options);
+
+  // Verify the parent stream info was set correctly
+  EXPECT_TRUE(stream->streamInfo().parentStreamInfo().has_value());
+  EXPECT_EQ(stream->streamInfo().parentStreamInfo().ptr(),
+            dynamic_cast<const StreamInfo::StreamInfo*>(&parent_stream_info));
+  EXPECT_NE(stream, nullptr);
+  EXPECT_EQ(stream->streamInfo().route()->routeEntry()->metadataMatchCriteria(), nullptr);
+}
+
+TEST_F(AsyncClientImplTest, MetadataMatchCriteriaWithNullRouteEntry) {
+  NiceMock<StreamInfo::MockStreamInfo> parent_stream_info;
+  const auto route = std::make_shared<NiceMock<Router::MockRoute>>();
+  EXPECT_CALL(parent_stream_info, route()).WillRepeatedly(Return(route));
+
+  EXPECT_CALL(*route, routeEntry()).WillRepeatedly(Return(nullptr));
+
+  auto options = AsyncClient::StreamOptions();
+  options.parent_context.stream_info = &parent_stream_info;
+
+  // Start the client - this should not crash
+  AsyncClient::Stream* stream = client_.start(stream_callbacks_, options);
+
+  // Verify the parent stream info was set correctly
+  EXPECT_TRUE(stream->streamInfo().parentStreamInfo().has_value());
+  EXPECT_EQ(stream->streamInfo().parentStreamInfo().ptr(),
+            dynamic_cast<const StreamInfo::StreamInfo*>(&parent_stream_info));
+  EXPECT_EQ(stream->streamInfo().route()->routeEntry()->metadataMatchCriteria(), nullptr);
+  EXPECT_NE(stream, nullptr);
+}
+
+TEST_F(AsyncClientImplTest, MetadataMatchCriteriaWithValidRouteEntry) {
+  NiceMock<StreamInfo::MockStreamInfo> parent_stream_info;
+  const auto route = std::make_shared<NiceMock<Router::MockRoute>>();
+  EXPECT_CALL(parent_stream_info, route()).WillRepeatedly(Return(route));
+
+  NiceMock<Router::MockRouteEntry> route_entry;
+  const auto metadata_criteria =
+      std::make_shared<Router::MetadataMatchCriteriaImpl>(Protobuf::Struct());
+  EXPECT_CALL(*route, routeEntry()).WillRepeatedly(Return(&route_entry));
+
+  EXPECT_CALL(route_entry, metadataMatchCriteria()).WillRepeatedly(Return(metadata_criteria.get()));
+
+  auto options = AsyncClient::StreamOptions();
+  options.parent_context.stream_info = &parent_stream_info;
+
+  // Start the client - this should set metadata_matching_criteria
+  AsyncClient::Stream* stream = client_.start(stream_callbacks_, options);
+
+  EXPECT_NE(stream, nullptr);
+
+  // Verify the parent stream info was set correctly
+  EXPECT_TRUE(stream->streamInfo().parentStreamInfo().has_value());
+  EXPECT_EQ(stream->streamInfo().parentStreamInfo().ptr(),
+            dynamic_cast<const StreamInfo::StreamInfo*>(&parent_stream_info));
+  EXPECT_EQ(stream->streamInfo().route()->routeEntry()->metadataMatchCriteria(),
+            metadata_criteria.get());
+}
+
 } // namespace
 
 // Must not be in anonymous namespace for friend to work.
@@ -2245,21 +2483,18 @@ class AsyncClientImplUnitTest : public AsyncClientImplTest {
 public:
   AsyncClientImplUnitTest() {
     envoy::config::route::v3::RetryPolicy proto_policy;
-    Upstream::RetryExtensionFactoryContextImpl factory_context(
-        client_.factory_context_.singletonManager());
-    auto policy_or_error =
-        Router::RetryPolicyImpl::create(proto_policy, ProtobufMessage::getNullValidationVisitor(),
-                                        factory_context, client_.factory_context_);
+    auto policy_or_error = Router::RetryPolicyImpl::create(
+        proto_policy, ProtobufMessage::getNullValidationVisitor(), client_.factory_context_);
     THROW_IF_NOT_OK_REF(policy_or_error.status());
     retry_policy_ = std::move(policy_or_error.value());
     EXPECT_TRUE(retry_policy_.get());
 
     route_impl_ = *NullRouteImpl::create(
-        client_.cluster_->name(), *retry_policy_, regex_engine_, absl::nullopt,
+        client_.cluster_->name(), retry_policy_, regex_engine_, absl::nullopt,
         Protobuf::RepeatedPtrField<envoy::config::route::v3::RouteAction::HashPolicy>());
   }
 
-  std::unique_ptr<Router::RetryPolicyImpl> retry_policy_;
+  std::shared_ptr<Router::RetryPolicyImpl> retry_policy_;
   Regex::GoogleReEngine regex_engine_;
   std::unique_ptr<NullRouteImpl> route_impl_;
   std::unique_ptr<Http::AsyncStreamImpl> stream_ = std::move(
@@ -2283,18 +2518,15 @@ public:
     envoy::config::route::v3::RetryPolicy proto_policy;
 
     TestUtility::loadFromYaml(yaml_config, proto_policy);
-    Upstream::RetryExtensionFactoryContextImpl factory_context(
-        client_.factory_context_.singletonManager());
-    auto policy_or_error =
-        Router::RetryPolicyImpl::create(proto_policy, ProtobufMessage::getNullValidationVisitor(),
-                                        factory_context, client_.factory_context_);
+    auto policy_or_error = Router::RetryPolicyImpl::create(
+        proto_policy, ProtobufMessage::getNullValidationVisitor(), client_.factory_context_);
     THROW_IF_NOT_OK_REF(policy_or_error.status());
     retry_policy_ = std::move(policy_or_error.value());
     EXPECT_TRUE(retry_policy_.get());
 
     stream_ = std::move(
         Http::AsyncStreamImpl::create(client_, stream_callbacks_,
-                                      AsyncClient::StreamOptions().setRetryPolicy(*retry_policy_))
+                                      AsyncClient::StreamOptions().setRetryPolicy(retry_policy_))
             .value());
   }
 
@@ -2324,11 +2556,11 @@ TEST_F(AsyncClientImplUnitTest, NullRouteImplInitTest) {
   EXPECT_TRUE(route_entry.upgradeMap().empty());
   EXPECT_EQ(false, route_entry.internalRedirectPolicy().enabled());
   EXPECT_TRUE(route_entry.shadowPolicies().empty());
-  EXPECT_TRUE(route_impl_->virtualHost().rateLimitPolicy().empty());
-  EXPECT_EQ(nullptr, route_impl_->virtualHost().corsPolicy());
-  EXPECT_FALSE(route_impl_->virtualHost().includeAttemptCountInRequest());
-  EXPECT_FALSE(route_impl_->virtualHost().includeAttemptCountInResponse());
-  EXPECT_FALSE(route_impl_->virtualHost().routeConfig().usesVhds());
+  EXPECT_TRUE(route_impl_->virtualHost()->rateLimitPolicy().empty());
+  EXPECT_EQ(nullptr, route_impl_->virtualHost()->corsPolicy());
+  EXPECT_FALSE(route_impl_->virtualHost()->includeAttemptCountInRequest());
+  EXPECT_FALSE(route_impl_->virtualHost()->includeAttemptCountInResponse());
+  EXPECT_FALSE(route_impl_->virtualHost()->routeConfig().usesVhds());
   EXPECT_EQ(nullptr, route_entry.tlsContextMatchCriteria());
 }
 
@@ -2346,14 +2578,14 @@ retry_back_off:
 
   auto& route_entry = getRouteFromStream();
 
-  EXPECT_EQ(route_entry.retryPolicy().numRetries(), 10);
-  EXPECT_EQ(route_entry.retryPolicy().perTryTimeout(), std::chrono::seconds(30));
+  EXPECT_EQ(route_entry.retryPolicy()->numRetries(), 10);
+  EXPECT_EQ(route_entry.retryPolicy()->perTryTimeout(), std::chrono::seconds(30));
   EXPECT_EQ(Router::RetryPolicy::RETRY_ON_CONNECT_FAILURE | Router::RetryPolicy::RETRY_ON_5XX |
                 Router::RetryPolicy::RETRY_ON_GATEWAY_ERROR | Router::RetryPolicy::RETRY_ON_RESET,
-            route_entry.retryPolicy().retryOn());
+            route_entry.retryPolicy()->retryOn());
 
-  EXPECT_EQ(route_entry.retryPolicy().baseInterval(), std::chrono::milliseconds(10));
-  EXPECT_EQ(route_entry.retryPolicy().maxInterval(), std::chrono::seconds(30));
+  EXPECT_EQ(route_entry.retryPolicy()->baseInterval(), std::chrono::milliseconds(10));
+  EXPECT_EQ(route_entry.retryPolicy()->maxInterval(), std::chrono::seconds(30));
 }
 
 TEST_F(AsyncClientImplUnitTest, AsyncStreamImplInitTestWithInvalidRetryPolicy) {
@@ -2387,23 +2619,181 @@ retry_back_off:
   setRetryPolicy(yaml);
   auto& route_entry = getRouteFromStream();
 
-  EXPECT_EQ(route_entry.retryPolicy().numRetries(), 10);
-  EXPECT_EQ(route_entry.retryPolicy().perTryTimeout(), std::chrono::seconds(30));
+  EXPECT_EQ(route_entry.retryPolicy()->numRetries(), 10);
+  EXPECT_EQ(route_entry.retryPolicy()->perTryTimeout(), std::chrono::seconds(30));
   EXPECT_EQ(Router::RetryPolicy::RETRY_ON_CONNECT_FAILURE | Router::RetryPolicy::RETRY_ON_5XX |
                 Router::RetryPolicy::RETRY_ON_GATEWAY_ERROR | Router::RetryPolicy::RETRY_ON_RESET |
                 Router::RetryPolicy::RETRY_ON_RESET_BEFORE_REQUEST,
-            route_entry.retryPolicy().retryOn());
+            route_entry.retryPolicy()->retryOn());
 
-  EXPECT_EQ(route_entry.retryPolicy().baseInterval(), std::chrono::milliseconds(10));
-  EXPECT_EQ(route_entry.retryPolicy().maxInterval(), std::chrono::seconds(30));
+  EXPECT_EQ(route_entry.retryPolicy()->baseInterval(), std::chrono::milliseconds(10));
+  EXPECT_EQ(route_entry.retryPolicy()->maxInterval(), std::chrono::seconds(30));
 }
 
 TEST_F(AsyncClientImplUnitTest, NullConfig) {
   EXPECT_FALSE(config_.mostSpecificHeaderMutationsWins());
 }
 
-TEST_F(AsyncClientImplUnitTest, NullVirtualHost) {
-  EXPECT_EQ(std::numeric_limits<uint32_t>::max(), vhost_.retryShadowBufferLimit());
+TEST_F(AsyncClientImplTest, UpstreamOverrideHost) {
+  Buffer::InstancePtr body{new Buffer::OwnedImpl("test body")};
+  Upstream::LoadBalancerContext::OverrideHost override_host{"192.168.1.100:8080", true};
+
+  EXPECT_CALL(cm_.thread_local_cluster_, httpConnPool(_, _, _, _))
+      .WillOnce(Invoke([&](Upstream::HostConstSharedPtr, Upstream::ResourcePriority,
+                           absl::optional<Http::Protocol>, Upstream::LoadBalancerContext* context) {
+        // Verify that the upstream override host is passed through the load balancer context
+        auto retrieved_override = context->overrideHostToSelect();
+        EXPECT_TRUE(retrieved_override.has_value());
+        EXPECT_EQ(retrieved_override->first, "192.168.1.100:8080");
+        EXPECT_EQ(retrieved_override->second, true);
+        return Upstream::HttpPoolData([]() {}, &cm_.thread_local_cluster_.conn_pool_);
+      }));
+
+  // Verify that the load balancer queries for the upstream override host
+  EXPECT_CALL(cm_.thread_local_cluster_, chooseHost(_))
+      .WillOnce(Invoke([&](Upstream::LoadBalancerContext* context) {
+        // The load balancer should call overrideHostToSelect() to get the override
+        auto retrieved_override = context->overrideHostToSelect();
+        EXPECT_TRUE(retrieved_override.has_value());
+        EXPECT_EQ(retrieved_override->first, "192.168.1.100:8080");
+        EXPECT_EQ(retrieved_override->second, true);
+        return Upstream::HostSelectionResponse{cm_.thread_local_cluster_.lb_.host_};
+      }));
+
+  EXPECT_CALL(cm_.thread_local_cluster_.conn_pool_, newStream(_, _, _))
+      .WillOnce(Invoke([&](ResponseDecoder& decoder, ConnectionPool::Callbacks& callbacks,
+                           const ConnectionPool::Instance::StreamOptions&) {
+        callbacks.onPoolReady(stream_encoder_, cm_.thread_local_cluster_.conn_pool_.host_,
+                              stream_info_, {});
+        response_decoder_ = &decoder;
+        return nullptr;
+      }));
+
+  TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  EXPECT_CALL(stream_encoder_, encodeHeaders(HeaderMapEqualRef(&headers), false));
+  EXPECT_CALL(stream_encoder_, encodeData(BufferEqual(body.get()), true));
+
+  expectResponseHeaders(stream_callbacks_, 200, false);
+  EXPECT_CALL(stream_callbacks_, onData(BufferEqual(body.get()), true));
+  EXPECT_CALL(stream_callbacks_, onComplete());
+
+  AsyncClient::StreamOptions options;
+  options.setUpstreamOverrideHost(override_host);
+  AsyncClient::Stream* stream = client_.start(stream_callbacks_, options);
+
+  stream->sendHeaders(headers, false);
+  stream->sendData(*body, true);
+
+  response_decoder_->decodeHeaders(
+      ResponseHeaderMapPtr(new TestResponseHeaderMapImpl{{":status", "200"}}), false);
+  response_decoder_->decodeData(*body, true);
+}
+
+TEST_F(AsyncClientImplTest, UpstreamOverrideHostNotStrict) {
+  Buffer::InstancePtr body{new Buffer::OwnedImpl("test body")};
+  Upstream::LoadBalancerContext::OverrideHost override_host{"example.com:8080", false};
+
+  EXPECT_CALL(cm_.thread_local_cluster_, httpConnPool(_, _, _, _))
+      .WillOnce(Invoke([&](Upstream::HostConstSharedPtr, Upstream::ResourcePriority,
+                           absl::optional<Http::Protocol>, Upstream::LoadBalancerContext* context) {
+        // Verify that the non-strict upstream override host is passed correctly
+        auto retrieved_override = context->overrideHostToSelect();
+        EXPECT_TRUE(retrieved_override.has_value());
+        EXPECT_EQ(retrieved_override->first, "example.com:8080");
+        EXPECT_EQ(retrieved_override->second, false);
+        return Upstream::HttpPoolData([]() {}, &cm_.thread_local_cluster_.conn_pool_);
+      }));
+
+  // Verify that the load balancer queries for the non-strict upstream override host
+  EXPECT_CALL(cm_.thread_local_cluster_, chooseHost(_))
+      .WillOnce(Invoke([&](Upstream::LoadBalancerContext* context) {
+        // The load balancer should call overrideHostToSelect() to get the override
+        auto retrieved_override = context->overrideHostToSelect();
+        EXPECT_TRUE(retrieved_override.has_value());
+        EXPECT_EQ(retrieved_override->first, "example.com:8080");
+        EXPECT_EQ(retrieved_override->second, false);
+        return Upstream::HostSelectionResponse{cm_.thread_local_cluster_.lb_.host_};
+      }));
+
+  EXPECT_CALL(cm_.thread_local_cluster_.conn_pool_, newStream(_, _, _))
+      .WillOnce(Invoke([&](ResponseDecoder& decoder, ConnectionPool::Callbacks& callbacks,
+                           const ConnectionPool::Instance::StreamOptions&) {
+        callbacks.onPoolReady(stream_encoder_, cm_.thread_local_cluster_.conn_pool_.host_,
+                              stream_info_, {});
+        response_decoder_ = &decoder;
+        return nullptr;
+      }));
+
+  TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  EXPECT_CALL(stream_encoder_, encodeHeaders(HeaderMapEqualRef(&headers), false));
+  EXPECT_CALL(stream_encoder_, encodeData(BufferEqual(body.get()), true));
+
+  expectResponseHeaders(stream_callbacks_, 200, false);
+  EXPECT_CALL(stream_callbacks_, onData(BufferEqual(body.get()), true));
+  EXPECT_CALL(stream_callbacks_, onComplete());
+
+  AsyncClient::StreamOptions options;
+  options.setUpstreamOverrideHost(override_host);
+  AsyncClient::Stream* stream = client_.start(stream_callbacks_, options);
+
+  stream->sendHeaders(headers, false);
+  stream->sendData(*body, true);
+
+  response_decoder_->decodeHeaders(
+      ResponseHeaderMapPtr(new TestResponseHeaderMapImpl{{":status", "200"}}), false);
+  response_decoder_->decodeData(*body, true);
+}
+
+TEST_F(AsyncClientImplTest, NoUpstreamOverrideHost) {
+  Buffer::InstancePtr body{new Buffer::OwnedImpl("test body")};
+
+  EXPECT_CALL(cm_.thread_local_cluster_, httpConnPool(_, _, _, _))
+      .WillOnce(Invoke([&](Upstream::HostConstSharedPtr, Upstream::ResourcePriority,
+                           absl::optional<Http::Protocol>, Upstream::LoadBalancerContext* context) {
+        // Verify that no upstream override host is set when not specified
+        auto retrieved_override = context->overrideHostToSelect();
+        EXPECT_FALSE(retrieved_override.has_value());
+        return Upstream::HttpPoolData([]() {}, &cm_.thread_local_cluster_.conn_pool_);
+      }));
+
+  // Verify that the load balancer queries for override host and gets nullopt
+  EXPECT_CALL(cm_.thread_local_cluster_, chooseHost(_))
+      .WillOnce(Invoke([&](Upstream::LoadBalancerContext* context) {
+        // The load balancer should call overrideHostToSelect() but get nullopt
+        auto retrieved_override = context->overrideHostToSelect();
+        EXPECT_FALSE(retrieved_override.has_value());
+        return Upstream::HostSelectionResponse{cm_.thread_local_cluster_.lb_.host_};
+      }));
+
+  EXPECT_CALL(cm_.thread_local_cluster_.conn_pool_, newStream(_, _, _))
+      .WillOnce(Invoke([&](ResponseDecoder& decoder, ConnectionPool::Callbacks& callbacks,
+                           const ConnectionPool::Instance::StreamOptions&) {
+        callbacks.onPoolReady(stream_encoder_, cm_.thread_local_cluster_.conn_pool_.host_,
+                              stream_info_, {});
+        response_decoder_ = &decoder;
+        return nullptr;
+      }));
+
+  TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  EXPECT_CALL(stream_encoder_, encodeHeaders(HeaderMapEqualRef(&headers), false));
+  EXPECT_CALL(stream_encoder_, encodeData(BufferEqual(body.get()), true));
+
+  expectResponseHeaders(stream_callbacks_, 200, false);
+  EXPECT_CALL(stream_callbacks_, onData(BufferEqual(body.get()), true));
+  EXPECT_CALL(stream_callbacks_, onComplete());
+
+  AsyncClient::StreamOptions options;
+  AsyncClient::Stream* stream = client_.start(stream_callbacks_, options);
+
+  stream->sendHeaders(headers, false);
+  stream->sendData(*body, true);
+
+  response_decoder_->decodeHeaders(
+      ResponseHeaderMapPtr(new TestResponseHeaderMapImpl{{":status", "200"}}), false);
+  response_decoder_->decodeData(*body, true);
 }
 
 } // namespace Http

@@ -201,19 +201,7 @@ static_assert(IP_RECVDSTADDR == IP_SENDSRCADDR);
 #define ENVOY_IPV6_MTU_DISCOVER_VALUE IPV6_PMTUDISC_DO
 #endif
 
-/**
- * Interface representing a single filter chain info.
- */
-class FilterChainInfo {
-public:
-  virtual ~FilterChainInfo() = default;
-
-  /**
-   * @return the name of this filter chain.
-   */
-  virtual absl::string_view name() const PURE;
-};
-
+class FilterChainInfo;
 class ListenerInfo;
 
 using FilterChainInfoConstSharedPtr = std::shared_ptr<const FilterChainInfo>;
@@ -261,6 +249,11 @@ public:
   virtual absl::string_view requestedServerName() const PURE;
 
   /**
+   * @return requestedApplicationProtocols value for downstream host.
+   */
+  virtual const std::vector<std::string>& requestedApplicationProtocols() const PURE;
+
+  /**
    * @return Connection ID of the downstream connection, or unset if not available.
    **/
   virtual absl::optional<uint64_t> connectionID() const PURE;
@@ -289,6 +282,11 @@ public:
    * @return ja3 fingerprint hash of the downstream connection, if any.
    */
   virtual absl::string_view ja3Hash() const PURE;
+
+  /**
+   * @return ja4 fingerprint hash of the downstream connection, if any.
+   */
+  virtual absl::string_view ja4Hash() const PURE;
 
   /**
    * @return roundTripTime of the connection
@@ -340,6 +338,12 @@ public:
   virtual void setRequestedServerName(const absl::string_view requested_server_name) PURE;
 
   /**
+   * @param protocols Application protocols requested.
+   */
+  virtual void
+  setRequestedApplicationProtocols(const std::vector<absl::string_view>& protocols) PURE;
+
+  /**
    * @param id Connection ID of the downstream connection.
    **/
   virtual void setConnectionID(uint64_t id) PURE;
@@ -365,6 +369,11 @@ public:
    * @param JA3 fingerprint.
    */
   virtual void setJA3Hash(const absl::string_view ja3_hash) PURE;
+
+  /**
+   * @param JA4 fingerprint.
+   */
+  virtual void setJA4Hash(const absl::string_view ja4_hash) PURE;
 
   /**
    * @param  milliseconds of round trip time of previous connection

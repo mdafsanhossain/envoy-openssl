@@ -80,12 +80,41 @@ GrpcJsonReverseTranscoderConfig::GrpcJsonReverseTranscoderConfig(
   api_version_header_ = transcoder_config.api_version_header().empty()
                             ? std::nullopt
                             : absl::make_optional(transcoder_config.api_version_header());
+
+  const auto& print_options = transcoder_config.request_json_print_options();
+  request_translate_options_.json_print_options.always_print_enums_as_ints =
+      print_options.always_print_enums_as_ints();
+  request_translate_options_.json_print_options.always_print_fields_with_no_presence =
+      print_options.always_print_primitive_fields();
+  // The inverse logic (`!`) is required here to maintain backward compatibility and avoid
+  // changing the JSON output format for existing users.
+  request_translate_options_.json_print_options.preserve_proto_field_names =
+      !print_options.use_canonical_field_names();
 }
 
 const Protobuf::MethodDescriptor*
 GrpcJsonReverseTranscoderConfig::GetMethodDescriptor(absl::string_view path) const {
+  // HCM guarantees the `:path` header is non-empty here.
+  ASSERT(!path.empty());
   std::string grpc_method = absl::StrReplaceAll(path.substr(1), {{"/", "."}});
   return descriptor_pool_.FindMethodByName(grpc_method);
+}
+
+absl::StatusOr<std::string>
+GrpcJsonReverseTranscoderConfig::ChangeBodyFieldName(absl::string_view message_name,
+                                                     absl::string_view body_field) const {
+  if (request_translate_options_.json_print_options.preserve_proto_field_names) {
+    return std::string(body_field);
+  }
+  const auto* type_descriptor = descriptor_pool_.FindMessageTypeByName(message_name);
+  if (type_descriptor == nullptr) {
+    return absl::InvalidArgumentError(absl::StrCat("No message named: ", message_name));
+  }
+  const auto* field_descriptor = type_descriptor->FindFieldByName(body_field);
+  if (field_descriptor == nullptr) {
+    return absl::InvalidArgumentError(absl::StrCat("No field named: ", body_field));
+  }
+  return std::string(field_descriptor->json_name());
 }
 
 bool GrpcJsonReverseTranscoderConfig::IsRequestNestedHttpBody(
@@ -96,15 +125,15 @@ bool GrpcJsonReverseTranscoderConfig::IsRequestNestedHttpBody(
   if (http_request_body_field.empty() || http_request_body_field == "*") {
     return false;
   }
-  const ProtobufWkt::Type* request_type = type_helper_->Info()->GetTypeByTypeUrl(request_type_url);
-  std::vector<const ProtobufWkt::Field*> request_body_field_path;
+  const Protobuf::Type* request_type = type_helper_->Info()->GetTypeByTypeUrl(request_type_url);
+  std::vector<const Protobuf::Field*> request_body_field_path;
   absl::Status status = type_helper_->ResolveFieldPath(*request_type, http_request_body_field,
                                                        &request_body_field_path);
   if (!status.ok() || request_body_field_path.empty()) {
     ENVOY_LOG(error, "Failed to resolve the request type: {}", request_type_url);
     return false;
   }
-  const ProtobufWkt::Type* request_body_type =
+  const Protobuf::Type* request_body_type =
       type_helper_->Info()->GetTypeByTypeUrl(request_body_field_path.back()->type_url());
 
   return request_body_type != nullptr &&
@@ -117,16 +146,9 @@ absl::StatusOr<std::unique_ptr<Transcoder>> GrpcJsonReverseTranscoderConfig::Cre
   std::string request_type_url =
       Grpc::Common::typeUrl(method_descriptor->input_type()->full_name());
 
-  RequestTranslateOptions request_translate_options;
-  // Setting this to true because we use body field from the google.api.http
-  // annotation to create the request payload after the request has been
-  // transcoded.
-  request_translate_options.json_print_options.preserve_proto_field_names = true;
-  // The reverse transcoder doesn't support streaming, setting it to any value
-  // will have no effect.
-  request_translate_options.stream_newline_delimited = false;
-  auto request_translator = std::make_unique<RequestTranslator>(
-      type_helper_->Resolver(), request_type_url, false, &request_input, request_translate_options);
+  auto request_translator =
+      std::make_unique<RequestTranslator>(type_helper_->Resolver(), request_type_url, false,
+                                          &request_input, request_translate_options_);
 
   ResponseInfo response_info;
   std::string response_type_url =

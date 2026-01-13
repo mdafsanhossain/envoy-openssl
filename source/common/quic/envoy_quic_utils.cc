@@ -1,15 +1,53 @@
 #include "source/common/quic/envoy_quic_utils.h"
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <memory>
+#include <string>
 
-#include "envoy/common/platform.h"
-#include "envoy/config/core/v3/base.pb.h"
+#include "envoy/api/os_sys_calls_common.h"
+#include "envoy/http/header_map.h"
+#include "envoy/http/stream_reset_handler.h"
+#include "envoy/network/address.h"
+#include "envoy/network/io_handle.h"
+#include "envoy/network/listen_socket.h"
+#include "envoy/network/socket.h"
+#include "envoy/network/socket_interface.h"
 
 #include "source/common/api/os_sys_calls_impl.h"
-#include "source/common/http/utility.h"
+#include "source/common/common/assert.h"
+#include "source/common/common/logger.h"
+#include "source/common/common/utility.h"
+#include "source/common/http/http_option_limits.h"
+#include "source/common/network/address_impl.h"
+#include "source/common/network/connection_socket_impl.h"
 #include "source/common/network/socket_option_factory.h"
-#include "source/common/network/utility.h"
 #include "source/common/protobuf/utility.h"
+#include "source/common/quic/quic_io_handle_wrapper.h"
+#include "source/common/runtime/runtime_features.h"
+
+#include "absl/numeric/int128.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "openssl/crypto.h"
+#include "openssl/ec.h"
+#include "openssl/ec_key.h"
+#include "openssl/evp.h"
+#include "openssl/nid.h"
+#include "openssl/rsa.h"
+#include "openssl/ssl.h"
+#include "openssl/x509.h"
+#include "quiche/common/http/http_header_block.h"
+#include "quiche/common/quiche_ip_address_family.h"
+#include "quiche/quic/core/quic_config.h"
+#include "quiche/quic/core/quic_constants.h"
+#include "quiche/quic/core/quic_error_codes.h"
+#include "quiche/quic/core/quic_tag.h"
+#include "quiche/quic/core/quic_time.h"
+#include "quiche/quic/core/quic_types.h"
+#include "quiche/quic/platform/api/quic_socket_address.h"
 
 namespace Envoy {
 namespace Quic {
@@ -95,11 +133,11 @@ quic::QuicRstStreamErrorCode envoyResetReasonToQuicRstError(Http::StreamResetRea
   case Http::StreamResetReason::LocalReset:
     return quic::QUIC_STREAM_REQUEST_REJECTED;
   case Http::StreamResetReason::OverloadManager:
-    return quic::QUIC_STREAM_CANCELLED;
+    return quic::QUIC_STREAM_EXCESSIVE_LOAD;
   case Http::StreamResetReason::ProtocolError:
     return quic::QUIC_STREAM_GENERAL_PROTOCOL_ERROR;
   case Http::StreamResetReason::Overflow:
-    IS_ENVOY_BUG("Resource overflow shouldn't be propergated to QUIC network stack");
+    IS_ENVOY_BUG("Resource overflow shouldn't be propagated to QUIC network stack");
     break;
   case Http::StreamResetReason::RemoteRefusedStreamReset:
   case Http::StreamResetReason::RemoteReset:
@@ -121,12 +159,11 @@ Http::StreamResetReason quicRstErrorToEnvoyLocalResetReason(quic::QuicRstStreamE
   case quic::QUIC_STREAM_CONNECTION_ERROR:
     return Http::StreamResetReason::LocalConnectionFailure;
   case quic::QUIC_STREAM_NO_ERROR:
+  case quic::QUIC_STREAM_CANCELLED:
   case quic::QUIC_STREAM_EXCESSIVE_LOAD:
   case quic::QUIC_HEADERS_TOO_LARGE:
   case quic::QUIC_STREAM_REQUEST_REJECTED:
     return Http::StreamResetReason::LocalReset;
-  case quic::QUIC_STREAM_CANCELLED:
-    return Http::StreamResetReason::OverloadManager;
   default:
     return Http::StreamResetReason::ProtocolError;
   }
@@ -141,13 +178,12 @@ Http::StreamResetReason quicRstErrorToEnvoyRemoteResetReason(quic::QuicRstStream
   case quic::QUIC_STREAM_CONNECT_ERROR:
     return Http::StreamResetReason::ConnectError;
   case quic::QUIC_STREAM_NO_ERROR:
+  case quic::QUIC_STREAM_CANCELLED:
   case quic::QUIC_STREAM_REQUEST_REJECTED:
   case quic::QUIC_STREAM_UNKNOWN_APPLICATION_ERROR_CODE:
   case quic::QUIC_STREAM_EXCESSIVE_LOAD:
   case quic::QUIC_HEADERS_TOO_LARGE:
     return Http::StreamResetReason::RemoteReset;
-  case quic::QUIC_STREAM_CANCELLED:
-    return Http::StreamResetReason::OverloadManager;
   case quic::QUIC_STREAM_GENERAL_PROTOCOL_ERROR:
   default:
     return Http::StreamResetReason::ProtocolError;
@@ -184,11 +220,8 @@ Http::StreamResetReason quicErrorCodeToEnvoyRemoteResetReason(quic::QuicErrorCod
 Network::ConnectionSocketPtr
 createConnectionSocket(const Network::Address::InstanceConstSharedPtr& peer_addr,
                        Network::Address::InstanceConstSharedPtr& local_addr,
-                       const Network::ConnectionSocket::OptionsSharedPtr& options,
-                       const bool prefer_gro) {
+                       const Network::ConnectionSocket::OptionsSharedPtr& options) {
   ASSERT(peer_addr != nullptr);
-  const bool should_connect =
-      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.quic_connect_client_udp_sockets");
   // NOTE: If changing the default cache size from 4 entries, make sure to profile it using
   // the benchmark test: //test/common/network:io_socket_handle_impl_benchmark
   //
@@ -200,10 +233,6 @@ createConnectionSocket(const Network::Address::InstanceConstSharedPtr& peer_addr
           "envoy.reloadable_features.quic_upstream_socket_use_address_cache_for_read")
           ? 4u
           : 0u;
-
-  if (local_addr == nullptr && !should_connect) {
-    local_addr = Network::Utility::getLocalAddress(peer_addr->ip()->version());
-  }
   auto connection_socket = std::make_unique<Network::ConnectionSocketImpl>(
       Network::Socket::Type::Datagram,
       // Use the loopback address if `local_addr` is null, to pass in the socket interface used to
@@ -218,7 +247,7 @@ createConnectionSocket(const Network::Address::InstanceConstSharedPtr& peer_addr
   connection_socket->addOptions(Network::SocketOptionFactory::buildIpPacketInfoOptions());
   connection_socket->addOptions(Network::SocketOptionFactory::buildRxQueueOverFlowOptions());
   connection_socket->addOptions(Network::SocketOptionFactory::buildIpRecvTosOptions());
-  if (prefer_gro && Api::OsSysCallsSingleton::get().supportsUdpGro()) {
+  if (Api::OsSysCallsSingleton::get().supportsUdpGro()) {
     connection_socket->addOptions(Network::SocketOptionFactory::buildUdpGroOptions());
   }
   if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.udp_set_do_not_fragment")) {
@@ -254,16 +283,16 @@ createConnectionSocket(const Network::Address::InstanceConstSharedPtr& peer_addr
     connection_socket->bind(local_addr);
     ASSERT(local_addr->ip());
   }
-  if (should_connect) {
-    if (auto result = connection_socket->connect(peer_addr); result.return_value_ == -1) {
-      connection_socket->close();
-      ENVOY_LOG_MISC(error, "Fail to connect socket: ({}) {}", result.errno_,
-                     errorDetails(result.errno_));
-      return connection_socket;
-    }
+  if (auto result = connection_socket->connect(peer_addr); result.return_value_ == -1) {
+    connection_socket->close();
+    ENVOY_LOG_MISC(error, "Fail to connect socket: ({}) {}", result.errno_,
+                   errorDetails(result.errno_));
+    return connection_socket;
   }
 
   local_addr = connection_socket->connectionInfoProvider().localAddress();
+  ENVOY_LOG_MISC(trace, "connected to local address: {}",
+                 local_addr != nullptr ? local_addr->asString() : "<none>");
   if (!Network::Socket::applyOptions(connection_socket->options(), *connection_socket,
                                      envoy::config::core::v3::SocketOption::STATE_BOUND)) {
     ENVOY_LOG_MISC(error, "Fail to apply post-bind options");
@@ -316,19 +345,20 @@ int deduceSignatureAlgorithmFromPublicKey(const EVP_PKEY* public_key, std::strin
     // Since we checked the key type above, this should be valid.
     ASSERT(rsa_public_key != nullptr);
     const unsigned rsa_key_length = RSA_size(rsa_public_key);
-#ifdef BORINGSSL_FIPS
-    if (rsa_key_length != 2048 / 8 && rsa_key_length != 3072 / 8 && rsa_key_length != 4096 / 8) {
-      *error_details = "Invalid leaf cert, only RSA certificates with 2048-bit, 3072-bit or "
-                       "4096-bit keys are supported in FIPS mode";
-      break;
+    const bool fips_mode = FIPS_mode();
+    if (fips_mode) {
+      if (rsa_key_length != 2048 / 8 && rsa_key_length != 3072 / 8 && rsa_key_length != 4096 / 8) {
+        *error_details = "Invalid leaf cert, only RSA certificates with 2048-bit, 3072-bit or "
+                         "4096-bit keys are supported in FIPS mode";
+        break;
+      }
+    } else {
+      if (rsa_key_length < 2048 / 8) {
+        *error_details =
+            "Invalid leaf cert, only RSA certificates with 2048-bit or larger keys are supported";
+        break;
+      }
     }
-#else
-    if (rsa_key_length < 2048 / 8) {
-      *error_details =
-          "Invalid leaf cert, only RSA certificates with 2048-bit or larger keys are supported";
-      break;
-    }
-#endif
     sign_alg = SSL_SIGN_RSA_PSS_RSAE_SHA256;
   } break;
   default:

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "envoy/common/pure.h"
+#include "envoy/extensions/transport_sockets/tls/v3/common.pb.h"
 #include "envoy/ssl/certificate_validation_context_config.h"
 #include "envoy/ssl/handshaker.h"
 #include "envoy/ssl/tls_certificate_config.h"
@@ -117,6 +118,13 @@ public:
    * @return the access log manager object reference
    */
   virtual AccessLog::AccessLogManager& accessLogManager() const PURE;
+
+  /**
+   * @return the compiance policy for the TLS context.
+   */
+  virtual absl::optional<
+      envoy::extensions::transport_sockets::tls::v3::TlsParameters::CompliancePolicy>
+  compliancePolicy() const PURE;
 };
 
 class ClientContextConfig : public virtual ContextConfig {
@@ -221,7 +229,12 @@ public:
   /**
    * @return a factory which can be used to create TLS context provider instances.
    */
-  virtual TlsCertificateSelectorFactory tlsCertificateSelectorFactory() const PURE;
+  virtual TlsCertificateSelectorFactory& tlsCertificateSelectorFactory() const PURE;
+
+  /**
+   * @return reference to the server names configured on the socket factory.
+   */
+  virtual const std::vector<std::string>& serverNames() const PURE;
 };
 
 using ServerContextConfigPtr = std::unique_ptr<ServerContextConfig>;

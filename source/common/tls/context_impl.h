@@ -67,10 +67,11 @@ struct TlsContext {
   }
   absl::Status loadCertificateChain(const std::string& data, const std::string& data_path);
   absl::Status loadPrivateKey(const std::string& data, const std::string& data_path,
-                              const std::string& password);
+                              const std::string& password, bool fips_mode);
   absl::Status loadPkcs12(const std::string& data, const std::string& data_path,
-                          const std::string& password);
-  absl::Status checkPrivateKey(const bssl::UniquePtr<EVP_PKEY>& pkey, const std::string& key_path);
+                          const std::string& password, bool fips_mode);
+  absl::Status checkPrivateKey(const bssl::UniquePtr<EVP_PKEY>& pkey, const std::string& key_path,
+                               bool fips_mode);
 };
 } // namespace Ssl
 
@@ -120,9 +121,11 @@ public:
 protected:
   friend class ContextImplPeer;
 
-  ContextImpl(Stats::Scope& scope, const Envoy::Ssl::ContextConfig& config,
-              Server::Configuration::CommonFactoryContext& factory_context,
-              Ssl::ContextAdditionalInitFunc additional_init, absl::Status& creation_status);
+  ContextImpl(
+      Stats::Scope& scope, const Envoy::Ssl::ContextConfig& config,
+      const std::vector<std::reference_wrapper<const Ssl::TlsCertificateConfig>>& tls_certificates,
+      Server::Configuration::CommonFactoryContext& factory_context,
+      Ssl::ContextAdditionalInitFunc additional_init, absl::Status& creation_status);
 
   /**
    * The global SSL-library index used for storing a pointer to the context
@@ -182,7 +185,6 @@ public:
   std::string category() const override { return "envoy.ssl.server_context_factory"; }
   virtual absl::StatusOr<Ssl::ServerContextSharedPtr>
   createServerContext(Stats::Scope& scope, const Envoy::Ssl::ServerContextConfig& config,
-                      const std::vector<std::string>& server_names,
                       Server::Configuration::CommonFactoryContext& factory_context,
                       Ssl::ContextAdditionalInitFunc additional_init) PURE;
 };

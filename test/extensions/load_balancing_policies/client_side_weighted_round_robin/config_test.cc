@@ -1,14 +1,14 @@
+#include "envoy/config/core/v3/extension.pb.h"
+
 #include "source/extensions/load_balancing_policies/client_side_weighted_round_robin/config.h"
 
-//#include "testing/base/public/gunit.h"
-#include "envoy/config/core/v3/extension.pb.h"
 #include "test/mocks/server/factory_context.h"
 #include "test/mocks/upstream/cluster_info.h"
 #include "test/mocks/upstream/priority_set.h"
 
 namespace Envoy {
 namespace Extensions {
-namespace LoadBalancingPolices {
+namespace LoadBalancingPolicies {
 namespace ClientSideWeightedRoundRobin {
 namespace {
 
@@ -47,6 +47,6 @@ TEST(ClientSideWeightedRoundRobinConfigTest, ValidateFail) {
 
 } // namespace
 } // namespace ClientSideWeightedRoundRobin
-} // namespace LoadBalancingPolices
+} // namespace LoadBalancingPolicies
 } // namespace Extensions
 } // namespace Envoy

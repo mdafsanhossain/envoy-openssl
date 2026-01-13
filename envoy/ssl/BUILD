@@ -39,6 +39,7 @@ envoy_cc_library(
         ":handshaker_interface",
         ":tls_certificate_config_interface",
         "//source/common/network:cidr_range_interface",
+        "@envoy_api//envoy/extensions/transport_sockets/tls/v3:pkg_cc_proto",
     ],
 )
 
@@ -75,6 +76,7 @@ envoy_cc_library(
 envoy_cc_library(
     name = "ssl_socket_extended_info_interface",
     hdrs = ["ssl_socket_extended_info.h"],
+    deps = [":handshaker_interface"],
 )
 
 envoy_cc_library(

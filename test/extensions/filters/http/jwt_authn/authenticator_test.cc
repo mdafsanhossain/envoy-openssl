@@ -52,7 +52,9 @@ public:
     auth_ = Authenticator::create(
         check_audience, provider, allow_failed, allow_missing, filter_config_->getJwksCache(),
         filter_config_->cm(),
-        [this](Upstream::ClusterManager&, const RemoteJwks&) { return std::move(fetcher_); },
+        [this](Upstream::ClusterManager&, Router::RetryPolicyConstSharedPtr, const RemoteJwks&) {
+          return std::move(fetcher_);
+        },
         filter_config_->timeSource());
     jwks_ = Jwks::createFrom(PublicKey, Jwks::JWKS);
     EXPECT_TRUE(jwks_->getStatus() == Status::Ok);
@@ -65,7 +67,7 @@ public:
                    google::jwt_verify::getStatusString(expected_status).c_str());
     };
     auto set_extracted_jwt_data_cb = [this](const std::string& name,
-                                            const ProtobufWkt::Struct& extracted_data) {
+                                            const Protobuf::Struct& extracted_data) {
       this->addExtractedData(name, extracted_data);
     };
     initTokenExtractor();
@@ -86,7 +88,7 @@ public:
 
   // This is like ContextImpl::addExtractedData in
   // source/extensions/filters/http/jwt_authn/verifier.cc.
-  void addExtractedData(const std::string& name, const ProtobufWkt::Struct& extracted_data) {
+  void addExtractedData(const std::string& name, const Protobuf::Struct& extracted_data) {
     *(*out_extracted_data_.mutable_fields())[name].mutable_struct_value() = extracted_data;
   }
 
@@ -98,7 +100,7 @@ public:
   JwksFetcherPtr fetcher_;
   AuthenticatorPtr auth_;
   ::google::jwt_verify::JwksPtr jwks_;
-  ProtobufWkt::Struct out_extracted_data_;
+  Protobuf::Struct out_extracted_data_;
   NiceMock<Tracing::MockSpan> parent_span_;
 };
 
@@ -318,7 +320,7 @@ TEST_F(AuthenticatorTest, TestSetPayload) {
   // Only one field is set.
   EXPECT_EQ(1, out_extracted_data_.fields().size());
 
-  ProtobufWkt::Value expected_payload;
+  Protobuf::Value expected_payload;
   TestUtility::loadFromJson(ExpectedPayloadJSON, expected_payload);
   EXPECT_TRUE(
       TestUtility::protoEqual(expected_payload, out_extracted_data_.fields().at("my_payload")));
@@ -350,7 +352,7 @@ TEST_F(AuthenticatorTest, TestSetPayloadWithSpaces) {
   // Only one field is set.
   EXPECT_EQ(1, out_extracted_data_.fields().size());
 
-  ProtobufWkt::Value expected_payload;
+  Protobuf::Value expected_payload;
   TestUtility::loadFromJson(ExpectedPayloadJSONWithSpaces, expected_payload);
   EXPECT_TRUE(
       TestUtility::protoEqual(expected_payload, out_extracted_data_.fields().at("my_payload")));
@@ -377,7 +379,7 @@ TEST_F(AuthenticatorTest, TestSetHeader) {
   EXPECT_EQ(1, out_extracted_data_.fields().size());
 
   // We should expect empty JWT payload.
-  ProtobufWkt::Value expected_payload;
+  Protobuf::Value expected_payload;
   TestUtility::loadFromJson(ExpectedHeaderJSON, expected_payload);
   EXPECT_TRUE(
       TestUtility::protoEqual(expected_payload, out_extracted_data_.fields().at("my_header")));
@@ -604,12 +606,12 @@ TEST_F(AuthenticatorTest, TestSetPayloadAndHeader) {
   EXPECT_EQ(2, out_extracted_data_.fields().size());
 
   // We should expect both JWT payload and header are set.
-  ProtobufWkt::Value expected_payload;
+  Protobuf::Value expected_payload;
   TestUtility::loadFromJson(ExpectedPayloadJSON, expected_payload);
   EXPECT_TRUE(
       TestUtility::protoEqual(expected_payload, out_extracted_data_.fields().at("my_payload")));
 
-  ProtobufWkt::Value expected_header;
+  Protobuf::Value expected_header;
   TestUtility::loadFromJson(ExpectedHeaderJSON, expected_header);
   EXPECT_TRUE(
       TestUtility::protoEqual(expected_header, out_extracted_data_.fields().at("my_header")));
@@ -1031,6 +1033,7 @@ TEST_F(AuthenticatorTest, TestAllowFailedMultipleIssuers) {
   header->set_value_prefix("Bearer ");
 
   createAuthenticator(nullptr, absl::nullopt, /*allow_failed=*/true);
+  EXPECT_CALL(*raw_fetcher_, cancel());
   EXPECT_CALL(*raw_fetcher_, fetch(_, _))
       .Times(2)
       .WillRepeatedly(Invoke([](Tracing::Span&, JwksFetcher::JwksReceiver& receiver) {
@@ -1089,7 +1092,7 @@ public:
     extractor_ = Extractor::create(jwks_cache_.jwks_data_.jwt_provider_);
     // Not to use jwks_fetcher, mocked that JwksObj already has Jwks
     EXPECT_CALL(jwks_cache_.jwks_data_, getJwksObj()).WillRepeatedly(Return(jwks_.get()));
-    EXPECT_CALL(mock_fetcher_, Call(_, _)).Times(0);
+    EXPECT_CALL(mock_fetcher_, Call(_, _, _)).Times(0);
   }
 
   void createAuthenticator(const absl::optional<std::string>& provider) {
@@ -1102,7 +1105,7 @@ public:
       ASSERT_EQ(status, expected_status);
     };
     auto set_extracted_jwt_data_cb = [this](const std::string& name,
-                                            const ProtobufWkt::Struct& extracted_data) {
+                                            const Protobuf::Struct& extracted_data) {
       out_name_ = name;
       out_extracted_data_ = extracted_data;
     };
@@ -1113,14 +1116,16 @@ public:
 
   ::google::jwt_verify::JwksPtr jwks_;
   NiceMock<MockJwksCache> jwks_cache_;
-  MockFunction<Common::JwksFetcherPtr(Upstream::ClusterManager&, const RemoteJwks&)> mock_fetcher_;
+  MockFunction<Common::JwksFetcherPtr(Upstream::ClusterManager&, Router::RetryPolicyConstSharedPtr,
+                                      const RemoteJwks&)>
+      mock_fetcher_;
   AuthenticatorPtr auth_;
   NiceMock<Upstream::MockClusterManager> cm_;
   Event::SimulatedTimeSystem time_system_;
   ExtractorConstPtr extractor_;
   NiceMock<Tracing::MockSpan> parent_span_;
   std::string out_name_;
-  ProtobufWkt::Struct out_extracted_data_;
+  Protobuf::Struct out_extracted_data_;
 };
 
 TEST_F(AuthenticatorJwtCacheTest, TestNonProvider) {
@@ -1183,7 +1188,7 @@ TEST_F(AuthenticatorJwtCacheTest, TestCacheHit) {
   // Payload is set
   EXPECT_EQ(out_name_, "my_payload");
 
-  ProtobufWkt::Struct expected_payload;
+  Protobuf::Struct expected_payload;
   TestUtility::loadFromJson(ExpectedPayloadJSON, expected_payload);
   EXPECT_TRUE(TestUtility::protoEqual(out_extracted_data_, expected_payload));
 }

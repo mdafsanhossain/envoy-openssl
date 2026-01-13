@@ -97,7 +97,7 @@ public:
   }
 
   FakeUpstream* grpc_receiver_upstream_{};
-  ProtobufWkt::Struct otel_runtime_config_;
+  Protobuf::Struct otel_runtime_config_;
 
   FakeHttpConnectionPtr connection_;
   std::vector<FakeStreamPtr> streams_;
@@ -106,7 +106,7 @@ public:
 struct TestCase {};
 
 OpenTelemetryTraceExporterIntegrationTest::OpenTelemetryTraceExporterIntegrationTest()
-    : HttpIntegrationTest(Http::CodecType::HTTP1, Network::Address::IpVersion::v4){};
+    : HttpIntegrationTest(Http::CodecType::HTTP1, Network::Address::IpVersion::v4) {};
 
 INSTANTIATE_TEST_SUITE_P(All, OpenTelemetryTraceExporterIntegrationTest,
                          // values are (min_flush_spans, num_requests)

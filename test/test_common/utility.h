@@ -9,6 +9,7 @@
 #include "envoy/api/api.h"
 #include "envoy/buffer/buffer.h"
 #include "envoy/network/address.h"
+#include "envoy/server/factory_context.h"
 #include "envoy/stats/stats.h"
 #include "envoy/stats/store.h"
 #include "envoy/thread/thread.h"
@@ -644,8 +645,7 @@ public:
    */
   static std::string nonZeroedGauges(const std::vector<Stats::GaugeSharedPtr>& gauges);
 
-  template <class MessageType>
-  static inline MessageType anyConvert(const ProtobufWkt::Any& message) {
+  template <class MessageType> static inline MessageType anyConvert(const Protobuf::Any& message) {
     return MessageUtil::anyConvert<MessageType>(message);
   }
 
@@ -701,7 +701,20 @@ public:
 
   template <class MessageType>
   static Config::DecodedResourcesWrapper
-  decodeResources(const Protobuf::RepeatedPtrField<ProtobufWkt::Any>& resources,
+  decodeResources(absl::flat_hash_map<std::string, MessageType> resources) {
+    Config::DecodedResourcesWrapper decoded_resources;
+    for (const auto& [name, resource] : resources) {
+      auto owned_resource = std::make_unique<MessageType>(resource);
+      decoded_resources.owned_resources_.emplace_back(
+          new Config::DecodedResourceImpl(std::move(owned_resource), name, {}, ""));
+      decoded_resources.refvec_.emplace_back(*decoded_resources.owned_resources_.back());
+    }
+    return decoded_resources;
+  }
+
+  template <class MessageType>
+  static Config::DecodedResourcesWrapper
+  decodeResources(const Protobuf::RepeatedPtrField<Protobuf::Any>& resources,
                   const std::string& version, const std::string& name_field = "name") {
     TestOpaqueResourceDecoderImpl<MessageType> resource_decoder(name_field);
     std::unique_ptr<Config::DecodedResourcesWrapper> tmp_wrapper =
@@ -764,8 +777,8 @@ public:
 
 #ifdef ENVOY_ENABLE_YAML
   /**
-   * Compare two JSON strings serialized from ProtobufWkt::Struct for equality. When two identical
-   * ProtobufWkt::Struct are serialized into JSON strings, the results have the same set of
+   * Compare two JSON strings serialized from Protobuf::Struct for equality. When two identical
+   * Protobuf::Struct are serialized into JSON strings, the results have the same set of
    * properties (values), but the positions may be different.
    *
    * @param lhs JSON string on LHS.
@@ -798,7 +811,7 @@ public:
     MessageUtil::loadFromJson(json, message, ProtobufMessage::getStrictValidationVisitor());
   }
 
-  static void loadFromJson(const std::string& json, ProtobufWkt::Struct& message) {
+  static void loadFromJson(const std::string& json, Protobuf::Struct& message) {
     MessageUtil::loadFromJson(json, message);
   }
 
@@ -814,22 +827,22 @@ public:
   static void jsonConvert(const Protobuf::Message& source, Protobuf::Message& dest) {
     // Explicit round-tripping to support conversions inside tests between arbitrary messages as a
     // convenience.
-    ProtobufWkt::Struct tmp;
+    Protobuf::Struct tmp;
     MessageUtil::jsonConvert(source, tmp);
     MessageUtil::jsonConvert(tmp, ProtobufMessage::getStrictValidationVisitor(), dest);
   }
 
-  static ProtobufWkt::Struct jsonToStruct(const std::string& json) {
-    ProtobufWkt::Struct message;
+  static Protobuf::Struct jsonToStruct(const std::string& json) {
+    Protobuf::Struct message;
     MessageUtil::loadFromJson(json, message);
     return message;
   }
 
-  static ProtobufWkt::Struct jsonArrayToStruct(const std::string& json) {
+  static Protobuf::Struct jsonArrayToStruct(const std::string& json) {
     // Hacky: add a surrounding root message, allowing JSON to be parsed into a struct.
     std::string root_message = absl::StrCat("{ \"testOnlyArrayRoot\": ", json, "}");
 
-    ProtobufWkt::Struct message;
+    Protobuf::Struct message;
     MessageUtil::loadFromJson(root_message, message);
     return message;
   }
@@ -885,6 +898,7 @@ namespace Tracing {
 
 class TestTraceContextImpl : public Tracing::TraceContext {
 public:
+  TestTraceContextImpl() = default;
   TestTraceContextImpl(const std::initializer_list<std::pair<std::string, std::string>>& values) {
     for (const auto& value : values) {
       context_map_[value.first] = value.second;
@@ -932,6 +946,39 @@ public:
   std::string context_path_;
   std::string context_method_;
   absl::flat_hash_map<std::string, std::string> context_map_;
+};
+
+class TestRequestHeaderTraceContextImpl : public Tracing::TraceContext {
+public:
+  TestRequestHeaderTraceContextImpl(Http::RequestHeaderMap& request_headers)
+      : request_headers_(request_headers) {}
+
+  absl::string_view protocol() const override { return request_headers_.getProtocolValue(); }
+  absl::string_view host() const override { return request_headers_.getHostValue(); }
+  absl::string_view path() const override { return request_headers_.getPathValue(); }
+  absl::string_view method() const override { return request_headers_.getMethodValue(); }
+  void forEach(IterateCallback callback) const override {
+    request_headers_.iterate([cb = std::move(callback)](const Http::HeaderEntry& entry) {
+      if (cb(entry.key().getStringView(), entry.value().getStringView())) {
+        return Http::HeaderMap::Iterate::Continue;
+      }
+      return Http::HeaderMap::Iterate::Break;
+    });
+  }
+  absl::optional<absl::string_view> get(absl::string_view key) const override {
+    Http::LowerCaseString lower_key{std::string(key)};
+    const auto entry = request_headers_.get(lower_key);
+    if (!entry.empty()) {
+      return entry[0]->value().getStringView();
+    }
+    return absl::nullopt;
+  }
+  void set(absl::string_view, absl::string_view) override {}
+  void remove(absl::string_view) override {}
+  OptRef<const Http::RequestHeaderMap> requestHeaders() const override { return request_headers_; };
+  OptRef<Http::RequestHeaderMap> requestHeaders() override { return request_headers_; };
+
+  Http::RequestHeaderMap& request_headers_;
 };
 
 } // namespace Tracing
@@ -1366,5 +1413,20 @@ MATCHER_P(JsonStringEq, expected, "") {
   do {                                                                                             \
   } while (0)
 #endif
+
+/**
+ * ScopedThreadLocalSingletonSetter is a helper class for setting a thread local server context for
+ * the duration of the lifetime of the object. The backing instance of singleton is owned by the
+ * caller.
+ */
+class ScopedThreadLocalServerContextSetter {
+public:
+  ~ScopedThreadLocalServerContextSetter() {
+    Server::Configuration::ServerFactoryContextInstance::clear();
+  }
+  ScopedThreadLocalServerContextSetter(Server::Configuration::ServerFactoryContext& context) {
+    Server::Configuration::ServerFactoryContextInstance::initialize(&context);
+  }
+};
 
 } // namespace Envoy

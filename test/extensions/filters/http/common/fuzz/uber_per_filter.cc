@@ -1,4 +1,5 @@
 #include "envoy/extensions/filters/http/file_system_buffer/v3/file_system_buffer.pb.h"
+#include "envoy/extensions/filters/http/grpc_json_reverse_transcoder/v3/transcoder.pb.h"
 #include "envoy/extensions/filters/http/grpc_json_transcoder/v3/transcoder.pb.h"
 #include "envoy/extensions/filters/http/jwt_authn/v3/config.pb.h"
 #include "envoy/extensions/filters/http/tap/v3/tap.pb.h"
@@ -52,6 +53,23 @@ void addBookstoreProtoDescriptor(Protobuf::Message* message) {
   addFileDescriptorsRecursively(*file_descriptor, descriptor_set, added_descriptors);
   descriptor_set.SerializeToString(config.mutable_proto_descriptor_bin());
 }
+
+void addBookstoreDescriptorReverseTranscoder(Protobuf::Message* message) {
+  envoy::extensions::filters::http::grpc_json_reverse_transcoder::v3::GrpcJsonReverseTranscoder&
+      config = *Envoy::Protobuf::DynamicCastMessage<
+          envoy::extensions::filters::http::grpc_json_reverse_transcoder::v3::
+              GrpcJsonReverseTranscoder>(message);
+  config.mutable_max_request_body_size()->set_value(101);
+  config.mutable_max_response_body_size()->set_value(101);
+  Protobuf::FileDescriptorSet descriptor_set;
+  const auto* file_descriptor =
+      Protobuf::DescriptorPool::generated_pool()->FindFileByName("test/proto/bookstore.proto");
+  ASSERT(file_descriptor != nullptr);
+  // Create a set to keep track of descriptors as they are added.
+  absl::flat_hash_set<absl::string_view> added_descriptors;
+  addFileDescriptorsRecursively(*file_descriptor, descriptor_set, added_descriptors);
+  descriptor_set.SerializeToString(config.mutable_descriptor_binary());
+}
 } // namespace
 
 void UberFilterFuzzer::guideAnyProtoType(test::fuzz::HttpData* mutable_data, uint choice) {
@@ -75,7 +93,7 @@ void UberFilterFuzzer::guideAnyProtoType(test::fuzz::HttpData* mutable_data, uin
       "type.googleapis.com/google.protobuf.Empty",
       "type.googleapis.com/google.api.HttpBody",
   };
-  ProtobufWkt::Any* mutable_any = mutable_data->mutable_proto_body()->mutable_message();
+  Protobuf::Any* mutable_any = mutable_data->mutable_proto_body()->mutable_message();
   const std::string& type_url = expected_types[choice % expected_types.size()];
   mutable_any->set_type_url(type_url);
 }
@@ -127,6 +145,9 @@ void UberFilterFuzzer::cleanFuzzedConfig(absl::string_view filter_name,
   if (filter_name == "envoy.filters.http.grpc_json_transcoder") {
     // Add a valid service proto descriptor.
     addBookstoreProtoDescriptor(message);
+  } else if (filter_name == "envoy.filters.http.grpc_json_reverse_transcoder") {
+    // Add a valid proto descriptor.
+    addBookstoreDescriptorReverseTranscoder(message);
   } else if (filter_name == "envoy.filters.http.tap") {
     // TapDS oneof field and OutputSinkType StreamingGrpc not implemented
     cleanTapConfig(message);
@@ -181,9 +202,17 @@ void UberFilterFuzzer::perFilterSetup() {
 
   // Prepare expectations for AWSRequestSigning filter
   ON_CALL(decoder_callbacks_, addDecodedData(_, _))
-      .WillByDefault([this](Buffer::Instance& data, bool) { decoding_buffer_ = &data; });
+      .WillByDefault([this](Buffer::Instance& data, bool) {
+        if (decoding_buffer_ == nullptr) {
+          decoding_buffer_ = std::make_unique<Buffer::OwnedImpl>();
+        }
+        decoding_buffer_->move(data);
+      });
   ON_CALL(decoder_callbacks_, decodingBuffer()).WillByDefault([this]() -> const Buffer::Instance* {
-    return decoding_buffer_;
+    if (decoding_buffer_ == nullptr) {
+      decoding_buffer_ = std::make_unique<Buffer::OwnedImpl>();
+    }
+    return decoding_buffer_.get();
   });
   ON_CALL(encoder_callbacks_, dispatcher()).WillByDefault([this]() -> Event::Dispatcher& {
     return *worker_thread_dispatcher_;

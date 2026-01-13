@@ -88,9 +88,10 @@ public:
         /*xds_config_tracker_=*/XdsConfigTrackerOptRef(),
         /*backoff_strategy_=*/std::move(backoff_strategy),
         /*target_xds_authority_=*/"",
-        /*eds_resources_cache_=*/std::unique_ptr<MockEdsResourcesCache>(eds_resources_cache_)};
+        /*eds_resources_cache_=*/std::unique_ptr<MockEdsResourcesCache>(eds_resources_cache_),
+        /*skip_subsequent_node_=*/false};
     if (isUnifiedMuxTest()) {
-      grpc_mux_ = std::make_unique<XdsMux::GrpcMuxDelta>(grpc_mux_context, false);
+      grpc_mux_ = std::make_unique<XdsMux::GrpcMuxDelta>(grpc_mux_context);
       return;
     }
     grpc_mux_ = std::make_unique<NewGrpcMuxImpl>(grpc_mux_context);
@@ -243,7 +244,7 @@ TEST_P(NewGrpcMuxImplTest, ReconnectionResetsNonceAndAcks) {
       .WillRepeatedly(Return(ttl_mgr_timer));
   setup();
   InSequence s;
-  const std::string& type_url = Config::TypeUrl::get().ClusterLoadAssignment;
+  const std::string& type_url = Config::TestTypeUrl::get().ClusterLoadAssignment;
   auto foo_sub = grpc_mux_->addWatch(type_url, {"x", "y"}, callbacks_, resource_decoder_, {});
   EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
   // Send on connection.
@@ -303,7 +304,7 @@ TEST_P(NewGrpcMuxImplTest, ReconnectionResetsWildcardSubscription) {
       .WillRepeatedly(Return(ttl_mgr_timer));
   setup();
   InSequence s;
-  const std::string& type_url = Config::TypeUrl::get().ClusterLoadAssignment;
+  const std::string& type_url = Config::TestTypeUrl::get().ClusterLoadAssignment;
   auto foo_sub = grpc_mux_->addWatch(type_url, {}, callbacks_, resource_decoder_, {});
   EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
   // Send a wildcard request on new connection.
@@ -388,7 +389,7 @@ TEST_P(NewGrpcMuxImplTest, ReconnectionResetsWildcardSubscription) {
 TEST_P(NewGrpcMuxImplTest, DiscoveryResponseNonexistentSub) {
   setup();
 
-  const std::string& type_url = Config::TypeUrl::get().ClusterLoadAssignment;
+  const std::string& type_url = Config::TestTypeUrl::get().ClusterLoadAssignment;
   auto watch = grpc_mux_->addWatch(type_url, {}, callbacks_, resource_decoder_, {});
 
   EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
@@ -428,7 +429,7 @@ TEST_P(NewGrpcMuxImplTest, DiscoveryResponseNonexistentSub) {
 TEST_P(NewGrpcMuxImplTest, ConfigUpdateWithAliases) {
   setup();
 
-  const std::string& type_url = Config::TypeUrl::get().VirtualHost;
+  const std::string& type_url = Config::TestTypeUrl::get().VirtualHost;
   SubscriptionOptions options;
   options.use_namespace_matching_ = true;
   auto watch = grpc_mux_->addWatch(type_url, {"prefix"}, callbacks_, resource_decoder_, options);
@@ -465,7 +466,7 @@ TEST_P(NewGrpcMuxImplTest, ConfigUpdateWithAliases) {
 TEST_P(NewGrpcMuxImplTest, ConfigUpdateWithNotFoundResponse) {
   setup();
 
-  const std::string& type_url = Config::TypeUrl::get().VirtualHost;
+  const std::string& type_url = Config::TestTypeUrl::get().VirtualHost;
   SubscriptionOptions options;
   options.use_namespace_matching_ = true;
   auto watch = grpc_mux_->addWatch(type_url, {"prefix"}, callbacks_, resource_decoder_, options);
@@ -486,7 +487,7 @@ TEST_P(NewGrpcMuxImplTest, ConfigUpdateWithNotFoundResponse) {
 TEST_P(NewGrpcMuxImplTest, XdsTpGlobCollection) {
   setup();
 
-  const std::string& type_url = Config::TypeUrl::get().ClusterLoadAssignment;
+  const std::string& type_url = Config::TestTypeUrl::get().ClusterLoadAssignment;
   xds::core::v3::ContextParams context_params;
   (*context_params.mutable_params())["foo"] = "bar";
   EXPECT_CALL(local_info_.context_provider_, nodeContext()).WillOnce(ReturnRef(context_params));
@@ -526,7 +527,7 @@ TEST_P(NewGrpcMuxImplTest, XdsTpGlobCollection) {
 TEST_P(NewGrpcMuxImplTest, XdsTpSingleton) {
   setup();
 
-  const std::string& type_url = Config::TypeUrl::get().ClusterLoadAssignment;
+  const std::string& type_url = Config::TestTypeUrl::get().ClusterLoadAssignment;
   EXPECT_CALL(local_info_.context_provider_, nodeContext()).Times(0);
   // We verify that the gRPC mux normalizes the context parameter order below. Node context
   // parameters are skipped.
@@ -627,7 +628,7 @@ TEST_P(NewGrpcMuxImplTest, CacheEdsResource) {
   eds_resources_cache_ = new NiceMock<MockEdsResourcesCache>();
   setup();
   InSequence s;
-  const std::string& type_url = Config::TypeUrl::get().ClusterLoadAssignment;
+  const std::string& type_url = Config::TestTypeUrl::get().ClusterLoadAssignment;
   auto watch = grpc_mux_->addWatch(type_url, {"x"}, callbacks_, resource_decoder_, {});
 
   EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
@@ -672,7 +673,7 @@ TEST_P(NewGrpcMuxImplTest, UpdateCacheEdsResource) {
   eds_resources_cache_ = new NiceMock<MockEdsResourcesCache>();
   setup();
   InSequence s;
-  const std::string& type_url = Config::TypeUrl::get().ClusterLoadAssignment;
+  const std::string& type_url = Config::TestTypeUrl::get().ClusterLoadAssignment;
   auto watch = grpc_mux_->addWatch(type_url, {"x"}, callbacks_, resource_decoder_, {});
 
   EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
@@ -722,7 +723,7 @@ TEST_P(NewGrpcMuxImplTest, AddRemoveSubscriptions) {
   eds_resources_cache_ = new NiceMock<MockEdsResourcesCache>();
   setup();
   InSequence s;
-  const std::string& type_url = Config::TypeUrl::get().ClusterLoadAssignment;
+  const std::string& type_url = Config::TestTypeUrl::get().ClusterLoadAssignment;
 
   {
     auto watch1 = grpc_mux_->addWatch(type_url, {"x"}, callbacks_, resource_decoder_, {});
@@ -846,7 +847,7 @@ TEST_P(NewGrpcMuxImplTest, MuxDynamicReplacementFetchingResources) {
   setup();
   InSequence s;
 
-  const std::string& type_url = Config::TypeUrl::get().ClusterLoadAssignment;
+  const std::string& type_url = Config::TestTypeUrl::get().ClusterLoadAssignment;
   auto foo_sub = grpc_mux_->addWatch(type_url, {"x", "y"}, callbacks_, resource_decoder_, {});
   EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
   expectSendMessage(type_url, {"x", "y"}, {});
@@ -934,7 +935,7 @@ TEST_P(NewGrpcMuxImplTest, RejectMuxDynamicReplacementRateLimitSettingsError) {
   setup();
   InSequence s;
 
-  const std::string& type_url = Config::TypeUrl::get().ClusterLoadAssignment;
+  const std::string& type_url = Config::TestTypeUrl::get().ClusterLoadAssignment;
   auto foo_sub = grpc_mux_->addWatch(type_url, {"x", "y"}, callbacks_, resource_decoder_, {});
   EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
   expectSendMessage(type_url, {"x", "y"}, {});

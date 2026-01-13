@@ -147,13 +147,12 @@ public:
       tls_cert->mutable_private_key()->set_filename(
           TestEnvironment::runfilesPath("test/config/integration/certs/upstreamkey.pem"));
       auto cfg = *Extensions::TransportSockets::Tls::ServerContextConfigImpl::create(
-          tls_context, factory_context_, false);
+          tls_context, factory_context_, {}, false);
       // upstream_stats_store_ should have been initialized be prior call to
       // BaseIntegrationTest::createXdsUpstream().
       ASSERT(upstream_stats_store_ != nullptr);
       auto context = *Extensions::TransportSockets::Tls::ServerSslSocketFactory::create(
-          std::move(cfg), context_manager_, *upstream_stats_store_->rootScope(),
-          std::vector<std::string>{});
+          std::move(cfg), context_manager_, *upstream_stats_store_->rootScope());
       addFakeUpstream(std::move(context), Http::CodecType::HTTP2, /*autonomous_upstream=*/false);
     }
     failover_xds_upstream_ = fake_upstreams_.back().get();
@@ -179,6 +178,15 @@ public:
   void primaryConnectionFailure() {
     AssertionResult result = xds_upstream_->waitForHttpConnection(*dispatcher_, xds_connection_);
     RELEASE_ASSERT(result, result.message());
+    // When GoogleGrpc is used, there may be cases where the connection will be
+    // disconnected before the gRPC library observes the TLS handshake, which will
+    // end up in a fast retry without notifying Envoy that the connection was
+    // disconnected. We wait for a stream to ensure that the gRPC library
+    // observed a successful connection.
+    if (clientType() == Grpc::ClientType::GoogleGrpc) {
+      result = xds_connection_->waitForNewStream(*dispatcher_, xds_stream_);
+      RELEASE_ASSERT(result, result.message());
+    }
     result = xds_connection_->close();
     RELEASE_ASSERT(result, result.message());
   }
@@ -263,17 +271,17 @@ public:
 
     EXPECT_TRUE(compareDiscoveryRequest(CdsTypeUrl, "1", {}, {}, {}, false,
                                         Grpc::Status::WellKnownGrpcStatus::Ok, "", xds_stream));
-    EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Listener, "", {}, {}, {}, false,
+    EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Listener, "", {}, {}, {}, false,
                                         Grpc::Status::WellKnownGrpcStatus::Ok, "", xds_stream));
 
     sendDiscoveryResponse<envoy::config::listener::v3::Listener>(
         LdsTypeUrl, {buildSimpleListener("listener_0", "cluster_0")},
         {buildSimpleListener("listener_0", "cluster_0")}, {}, "1", {}, xds_stream);
 
-    EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().ClusterLoadAssignment, "1",
+    EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().ClusterLoadAssignment, "1",
                                         {"cluster_0"}, {}, {}, false,
                                         Grpc::Status::WellKnownGrpcStatus::Ok, "", xds_stream));
-    EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Listener, "1", {}, {}, {}, false,
+    EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Listener, "1", {}, {}, {}, false,
                                         Grpc::Status::WellKnownGrpcStatus::Ok, "", xds_stream));
 
     test_server_->waitForCounterGe("listener_manager.listener_create_success", 1);
@@ -629,7 +637,7 @@ TEST_P(XdsFailoverAdsIntegrationTest, PrimaryUseAfterFailoverResponseAndDisconne
   EXPECT_TRUE(compareDiscoveryRequest(CdsTypeUrl, "failover1", {}, {}, {}, false,
                                       Grpc::Status::WellKnownGrpcStatus::Ok, "",
                                       failover_xds_stream_.get()));
-  EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Listener, "", {}, {}, {}, false,
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Listener, "", {}, {}, {}, false,
                                       Grpc::Status::WellKnownGrpcStatus::Ok, "",
                                       failover_xds_stream_.get()));
 
@@ -748,7 +756,7 @@ TEST_P(XdsFailoverAdsIntegrationTest, FailoverUseAfterFailoverResponseAndDisconn
   EXPECT_TRUE(compareDiscoveryRequest(CdsTypeUrl, "failover1", {}, {}, {}, false,
                                       Grpc::Status::WellKnownGrpcStatus::Ok, "",
                                       failover_xds_stream_.get()));
-  EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Listener, "", {}, {}, {}, false,
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Listener, "", {}, {}, {}, false,
                                       Grpc::Status::WellKnownGrpcStatus::Ok, "",
                                       failover_xds_stream_.get()));
 
@@ -872,7 +880,7 @@ TEST_P(XdsFailoverAdsIntegrationTest,
   EXPECT_TRUE(compareDiscoveryRequest(CdsTypeUrl, "failover1", {}, {}, {}, false,
                                       Grpc::Status::WellKnownGrpcStatus::Ok, "",
                                       failover_xds_stream_.get()));
-  EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Listener, "", {}, {}, {}, false,
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Listener, "", {}, {}, {}, false,
                                       Grpc::Status::WellKnownGrpcStatus::Ok, "",
                                       failover_xds_stream_.get()));
 

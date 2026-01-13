@@ -109,6 +109,58 @@ TEST_P(GrpcClientIntegrationTest, BasicStream) {
   stream->waitForReset();
 }
 
+TEST_P(GrpcClientIntegrationTest, BasicStreamWithGracefulClose) {
+  initialize();
+  auto stream = createStream(empty_metadata_);
+  stream->sendRequest();
+  stream->sendServerInitialMetadata(empty_metadata_);
+  stream->sendReply();
+  stream->closeStream();
+  stream->sendServerTrailers(Status::WellKnownGrpcStatus::Ok, "", empty_metadata_);
+  dispatcher_helper_.runDispatcher();
+  EXPECT_EQ(cm_.thread_local_cluster_.cluster_.info_->trafficStats()->upstream_rq_tx_reset_.value(),
+            0);
+}
+
+TEST_P(GrpcClientIntegrationTest, BasicStreamDeleteOnRemoteClose) {
+  setOnDeleteCallback();
+  initialize();
+  auto stream = createStream(empty_metadata_);
+  stream->sendRequest();
+  stream->sendServerInitialMetadata(empty_metadata_);
+  stream->sendReply();
+  stream->runDispatcherUntilResponseReceived();
+
+  stream->closeStream();
+  stream->waitForRemoteCloseAndDelete();
+  stream->encodeServerTrailers(Status::WellKnownGrpcStatus::Ok, "", empty_metadata_);
+  runDispatcherUntilStreamDeletion();
+  EXPECT_EQ(cm_.thread_local_cluster_.cluster_.info_->trafficStats()->upstream_rq_tx_reset_.value(),
+            0);
+}
+
+TEST_P(GrpcClientIntegrationTest, BasicStreamDeleteOnTimeout) {
+  // Make remote close timeout small, so that the test does not timeout.
+  remote_close_timeout_ = std::chrono::milliseconds(100);
+  setOnDeleteCallback();
+  initialize();
+  auto stream = createStream(empty_metadata_);
+  stream->sendRequest();
+  stream->sendServerInitialMetadata(empty_metadata_);
+  stream->sendReply();
+  stream->runDispatcherUntilResponseReceived();
+
+  stream->closeStream();
+  stream->waitForRemoteCloseAndDelete();
+  runDispatcherUntilStreamDeletion();
+  // Stream is reset if remote close timer expires.
+  if (clientType() == ClientType::EnvoyGrpc) {
+    // Envoy gRPC based AsyncGrpcClient also increments a counter.
+    EXPECT_EQ(
+        cm_.thread_local_cluster_.cluster_.info_->trafficStats()->upstream_rq_tx_reset_.value(), 1);
+  }
+}
+
 // Validate that a simple request-reply stream works.
 TEST_P(GrpcClientIntegrationTest, BasicStreamGracefulClose) {
   initialize();
@@ -212,12 +264,14 @@ TEST_P(GrpcClientIntegrationTest, BasicStreamWithBytesMeter) {
   auto upstream_meter = stream->grpc_stream_->streamInfo().getUpstreamBytesMeter();
   uint64_t total_bytes_sent = upstream_meter->wireBytesSent();
   uint64_t header_bytes_sent = upstream_meter->headerBytesSent();
+  uint64_t decompressed_header_bytes_sent = upstream_meter->decompressedHeaderBytesSent();
   // Verify the number of sent bytes that is tracked in stream info equals to the length of
   // request buffer.
   // Note, in HTTP2 codec, H2_FRAME_HEADER_SIZE is always included in bytes meter so we need to
   // account for it in the check here as well.
   EXPECT_EQ(total_bytes_sent - header_bytes_sent,
             send_buf->length() + Http::Http2::H2_FRAME_HEADER_SIZE);
+  EXPECT_GE(decompressed_header_bytes_sent, header_bytes_sent);
 
   stream->sendReply(/*check_response_size=*/true);
   stream->sendServerTrailers(Status::WellKnownGrpcStatus::Ok, "", empty_metadata_);
@@ -292,14 +346,18 @@ TEST_P(GrpcClientIntegrationTest, MultiStreamWithBytesMeter) {
   auto upstream_meter_0 = stream_0->grpc_stream_->streamInfo().getUpstreamBytesMeter();
   uint64_t total_bytes_sent = upstream_meter_0->wireBytesSent();
   uint64_t header_bytes_sent = upstream_meter_0->headerBytesSent();
+  uint64_t decompressed_header_bytes_sent = upstream_meter_0->decompressedHeaderBytesSent();
   EXPECT_EQ(total_bytes_sent - header_bytes_sent,
             send_buf->length() + Http::Http2::H2_FRAME_HEADER_SIZE);
+  EXPECT_GE(decompressed_header_bytes_sent, header_bytes_sent);
 
   auto upstream_meter_1 = stream_1->grpc_stream_->streamInfo().getUpstreamBytesMeter();
   uint64_t total_bytes_sent_1 = upstream_meter_1->wireBytesSent();
   uint64_t header_bytes_sent_1 = upstream_meter_1->headerBytesSent();
+  uint64_t decompressed_header_bytes_sent_1 = upstream_meter_1->decompressedHeaderBytesSent();
   EXPECT_EQ(total_bytes_sent_1 - header_bytes_sent_1,
             send_buf->length() + Http::Http2::H2_FRAME_HEADER_SIZE);
+  EXPECT_GE(decompressed_header_bytes_sent_1, header_bytes_sent_1);
 
   stream_0->sendServerInitialMetadata(empty_metadata_);
   stream_0->sendReply(true);
@@ -500,8 +558,17 @@ TEST_P(GrpcClientIntegrationTest, StreamClientInitialMetadata) {
   const TestMetadata initial_metadata = {
       {Http::LowerCaseString("foo"), "bar"},
       {Http::LowerCaseString("baz"), "blah"},
+      {Http::LowerCaseString("hello-world-in-japanese-bin"), "こんにちは 世界"},
   };
-  auto stream = createStream(initial_metadata);
+  auto stream = createStream(
+      initial_metadata,
+      TestMetadata{{Http::LowerCaseString("foo"), "bar"},
+                   {Http::LowerCaseString("baz"), "blah"},
+                   {Http::LowerCaseString("hello-world-in-japanese-bin"),
+                    // Google base64 encoding doesn't do padding.
+                    clientType() == ClientType::EnvoyGrpc ? "44GT44KT44Gr44Gh44GvIOS4lueVjA=="
+                                                          : "44GT44KT44Gr44Gh44GvIOS4lueVjA"}});
+
   stream->sendServerTrailers(Status::WellKnownGrpcStatus::Ok, "", empty_metadata_, true);
   dispatcher_helper_.runDispatcher();
 }
@@ -529,6 +596,7 @@ TEST_P(GrpcClientIntegrationTest, RequestServiceWideInitialMetadata) {
 }
 
 // Validate that receiving server initial metadata works.
+// And -bin headers stay encoded.
 TEST_P(GrpcClientIntegrationTest, ServerInitialMetadata) {
   initialize();
   auto stream = createStream(empty_metadata_);
@@ -536,7 +604,8 @@ TEST_P(GrpcClientIntegrationTest, ServerInitialMetadata) {
   const TestMetadata initial_metadata = {
       {Http::LowerCaseString("foo"), "bar"},
       {Http::LowerCaseString("baz"), "blah"},
-      {Http::LowerCaseString("binary-bin"), "help"},
+      {Http::LowerCaseString("hello-world-in-japanese-bin"),
+       "44GT44KT44Gr44Gh44GvIOS4lueVjA==" /*"こんにちは 世界"*/},
   };
   stream->sendServerInitialMetadata(initial_metadata);
   stream->sendReply();
@@ -544,7 +613,7 @@ TEST_P(GrpcClientIntegrationTest, ServerInitialMetadata) {
   dispatcher_helper_.runDispatcher();
 }
 
-// Validate that receiving server trailing metadata works.
+// Validates that receiving server trailing metadata works.
 TEST_P(GrpcClientIntegrationTest, ServerTrailingMetadata) {
   initialize();
   auto stream = createStream(empty_metadata_);
@@ -553,9 +622,11 @@ TEST_P(GrpcClientIntegrationTest, ServerTrailingMetadata) {
   stream->sendReply();
   const TestMetadata trailing_metadata = {
       {Http::LowerCaseString("foo"), "bar"},
+      {Http::LowerCaseString("hello-world-in-japanese-bin"), "44GT44KT44Gr44Gh44GvIOS4lueVjA=="},
       {Http::LowerCaseString("baz"), "blah"},
   };
-  stream->sendServerTrailers(Status::WellKnownGrpcStatus::Ok, "", trailing_metadata);
+  stream->sendServerTrailers(Status::WellKnownGrpcStatus::Ok, "", trailing_metadata,
+                             /*trailers_only=*/false);
   dispatcher_helper_.runDispatcher();
 }
 
@@ -732,10 +803,10 @@ public:
     return config;
   }
 
-  std::string access_token_value_{};
-  std::string access_token_value_2_{};
-  std::string refresh_token_value_{};
-  std::string credentials_factory_name_{};
+  std::string access_token_value_;
+  std::string access_token_value_2_;
+  std::string refresh_token_value_;
+  std::string credentials_factory_name_;
 };
 
 // Parameterize the loopback test server socket address and gRPC client type.

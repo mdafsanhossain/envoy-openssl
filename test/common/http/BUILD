@@ -162,6 +162,7 @@ envoy_cc_test(
     deps = [
         "//source/common/http:codec_wrappers_lib",
         "//test/mocks/http:http_mocks",
+        "//test/test_common:test_runtime_lib",
         "//test/test_common:utility_lib",
     ],
 )
@@ -293,7 +294,22 @@ envoy_cc_test(
         # Split to avoid compiler OOM, especially on ASAN.
         "conn_manager_impl_test.cc",
         "conn_manager_impl_test_2.cc",
+        "conn_manager_impl_test_3.cc",
     ],
+    rbe_pool = "2core",
+    shard_count = 5,
+    deps = [
+        ":conn_manager_impl_test_base_lib",
+        ":custom_header_extension_lib",
+        "//envoy/network:proxy_protocol_options_lib",
+        "//test/extensions/filters/network/common/fuzz/utils:network_filter_fuzzer_fakes_lib",
+        "//test/server:utility_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "conn_manager_misc_test",
+    srcs = ["conn_manager_misc_test.cc"],
     rbe_pool = "2core",
     shard_count = 5,
     deps = [
@@ -458,6 +474,7 @@ envoy_cc_test(
         "//source/common/http:utility_lib",
         "//source/common/network:address_lib",
         "//test/mocks/http:http_mocks",
+        "//test/mocks/server:factory_context_mocks",
         "//test/mocks/upstream:upstream_mocks",
         "//test/test_common:test_runtime_lib",
         "//test/test_common:utility_lib",
@@ -510,6 +527,7 @@ envoy_cc_test(
         "//test/mocks/network:connection_mocks",
         "//test/mocks/router:router_mocks",
         "//test/mocks/runtime:runtime_mocks",
+        "//test/mocks/server:overload_manager_mocks",
         "//test/mocks/stats:stats_mocks",
         "//test/test_common:test_runtime_lib",
     ],
@@ -532,7 +550,8 @@ envoy_cc_test(
         "//test/mocks/router:router_mocks",
         "//test/mocks/runtime:runtime_mocks",
         "//test/mocks/stats:stats_mocks",
-        "//test/mocks/server:transport_socket_factory_context_mocks",
+        "//test/mocks/server:factory_context_mocks",
+        "//test/mocks/server:overload_manager_mocks",
         "//test/test_common:threadsafe_singleton_injector_lib",
         "//test/test_common:test_runtime_lib",
         "//source/common/quic:quic_client_factory_lib",
@@ -634,6 +653,7 @@ envoy_cc_test(
     deps = [
         "//source/common/formatter:formatter_extension_lib",
         "//source/common/http:header_mutation_lib",
+        "//test/mocks/server:server_factory_context_mocks",
         "//test/mocks/stream_info:stream_info_mocks",
         "//test/test_common:utility_lib",
     ],
@@ -689,5 +709,21 @@ envoy_cc_fuzz_test(
         "//test/test_common:simulated_time_system_lib",
         "//test/test_common:test_runtime_lib",
         "@envoy_api//envoy/extensions/upstreams/http/generic/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_test(
+    name = "muxdemux_test",
+    srcs = ["muxdemux_test.cc"],
+    deps = [
+        "//envoy/http:header_map_interface",
+        "//source/common/buffer:buffer_lib",
+        "//source/common/http:muxdemux_lib",
+        "//test/mocks/http:http_mocks",
+        "//test/mocks/server:factory_context_mocks",
+        "//test/test_common:status_utility_lib",
+        "//test/test_common:utility_lib",
+        "@com_google_absl//absl/status",
+        "@ocp//ocpdiag/core/testing:status_matchers",
     ],
 )

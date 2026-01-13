@@ -41,15 +41,23 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "codec_runtime_overrides",
+    hdrs = ["codec_runtime_overrides.h"],
+    deps = ["@com_google_absl//absl/strings"],
+)
+
+envoy_cc_library(
     name = "codec_interface",
     hdrs = ["codec.h"],
     deps = [
+        ":codec_runtime_overrides",
         ":header_map_interface",
         ":metadata_interface",
         ":protocol_interface",
         ":stream_reset_handler_interface",
         "//envoy/access_log:access_log_interface",
         "//envoy/buffer:buffer_interface",
+        "//envoy/common:matchers_interface",
         "//envoy/grpc:status",
         "//envoy/network:address_interface",
         "//envoy/stream_info:stream_info_interface",
@@ -128,7 +136,7 @@ envoy_cc_library(
     deps = [
         ":header_map_interface",
         "//envoy/network:address_interface",
-        "//envoy/stream_info:filter_state_interface",
+        "//envoy/stream_info:stream_info_interface",
     ],
 )
 
@@ -216,7 +224,7 @@ envoy_cc_library(
     name = "header_evaluator",
     hdrs = ["header_evaluator.h"],
     deps = [
-        "//envoy/formatter:substitution_formatter_interface",
+        "//envoy/formatter:http_formatter_context_interface",
         "//envoy/http:header_map_interface",
         "//envoy/stream_info:stream_info_interface",
     ],

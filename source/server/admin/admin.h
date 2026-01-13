@@ -128,6 +128,13 @@ public:
     return request_id_extension_;
   }
   const AccessLog::InstanceSharedPtrVector& accessLogs() override { return access_logs_; }
+  bool acceptTargetPath(absl::string_view path_name) const {
+    return std::any_of(allowlisted_paths_.begin(), allowlisted_paths_.end(),
+                       [path_name](const Matchers::StringMatcherPtr& matcher) {
+                         return matcher->match(path_name);
+                       });
+  }
+  void addAllowlistedPath(Matchers::StringMatcherPtr matcher);
   bool flushAccessLogOnNewRequest() override { return flush_access_log_on_new_request_; }
   bool flushAccessLogOnTunnelSuccessfullyEstablished() const override { return false; }
   const absl::optional<std::chrono::milliseconds>& accessLogFlushInterval() override {
@@ -152,6 +159,9 @@ public:
   uint32_t maxRequestHeadersKb() const override { return max_request_headers_kb_; }
   uint32_t maxRequestHeadersCount() const override { return max_request_headers_count_; }
   std::chrono::milliseconds streamIdleTimeout() const override { return {}; }
+  absl::optional<std::chrono::milliseconds> streamFlushTimeout() const override {
+    return std::nullopt;
+  }
   std::chrono::milliseconds requestTimeout() const override { return {}; }
   std::chrono::milliseconds requestHeadersTimeout() const override { return {}; }
   std::chrono::milliseconds delayedCloseTimeout() const override { return {}; }
@@ -220,7 +230,7 @@ public:
   void closeSocket() override;
   void addListenerToHandler(Network::ConnectionHandler* handler) override;
 
-  uint64_t maxRequestsPerConnection() const override { return 0; }
+  uint32_t maxRequestsPerConnection() const override { return 0; }
   const HttpConnectionManagerProto::ProxyStatusConfig* proxyStatusConfig() const override {
     return proxy_status_config_.get();
   }
@@ -441,9 +451,16 @@ private:
 
     absl::string_view name() const override { return "admin"; }
 
+    bool addedViaApi() const override { return false; }
+
+    const Network::FilterChainInfoSharedPtr& filterChainInfo() const override {
+      return filter_chain_info_;
+    }
+
   private:
     const Network::RawBufferSocketFactory transport_socket_factory_;
     const Filter::NetworkFilterFactoriesList empty_network_filter_factory_;
+    const Network::FilterChainInfoSharedPtr filter_chain_info_;
   };
 
   Server::Instance& server_;
@@ -451,6 +468,7 @@ private:
   AdminFactoryContext factory_context_;
   Http::RequestIDExtensionSharedPtr request_id_extension_;
   AccessLog::InstanceSharedPtrVector access_logs_;
+  std::vector<Matchers::StringMatcherPtr> allowlisted_paths_;
   const bool flush_access_log_on_new_request_ = false;
   const absl::optional<std::chrono::milliseconds> null_access_log_flush_interval_;
   const std::string profile_path_;

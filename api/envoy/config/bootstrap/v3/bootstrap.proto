@@ -16,6 +16,7 @@ import "envoy/config/metrics/v3/stats.proto";
 import "envoy/config/overload/v3/overload.proto";
 import "envoy/config/trace/v3/http_tracer.proto";
 import "envoy/extensions/transport_sockets/tls/v3/secret.proto";
+import "envoy/type/matcher/v3/string.proto";
 import "envoy/type/v3/percent.proto";
 
 import "google/protobuf/duration.proto";
@@ -41,7 +42,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 // <config_overview_bootstrap>` for more detail.
 
 // Bootstrap :ref:`configuration overview <config_overview_bootstrap>`.
-// [#next-free-field: 42]
+// [#next-free-field: 43]
 message Bootstrap {
   option (udpa.annotations.versioning).previous_message_type =
       "envoy.config.bootstrap.v2.Bootstrap";
@@ -57,9 +58,7 @@ message Bootstrap {
     // If a network based configuration source is specified for :ref:`cds_config
     // <envoy_v3_api_field_config.bootstrap.v3.Bootstrap.DynamicResources.cds_config>`, it's necessary
     // to have some initial cluster definitions available to allow Envoy to know
-    // how to speak to the management server. These cluster definitions may not
-    // use :ref:`EDS <arch_overview_dynamic_config_eds>` (i.e. they should be static
-    // IP or DNS-based).
+    // how to speak to the management server.
     repeated cluster.v3.Cluster clusters = 2;
 
     // These static secrets can be used by :ref:`SdsSecretConfig
@@ -230,6 +229,14 @@ message Bootstrap {
     // a flush timer is not created. Only one of ``stats_flush_on_admin`` or
     // ``stats_flush_interval`` can be set.
     bool stats_flush_on_admin = 29 [(validate.rules).bool = {const: true}];
+  }
+
+  oneof stats_eviction {
+    // Optional duration to perform metric eviction. At every interval, during the stats flush
+    // the unused metrics are removed from the worker caches and the used metrics
+    // are marked as unused. Must be a multiple of the ``stats_flush_interval``.
+    google.protobuf.Duration stats_eviction_interval = 42
+        [(validate.rules).duration = {gte {nanos: 1000000}}];
   }
 
   // Optional watchdog configuration.
@@ -419,7 +426,7 @@ message Bootstrap {
 
 // Administration interface :ref:`operations documentation
 // <operations_admin_interface>`.
-// [#next-free-field: 7]
+// [#next-free-field: 8]
 message Admin {
   option (udpa.annotations.versioning).previous_message_type = "envoy.config.bootstrap.v2.Admin";
 
@@ -449,6 +456,21 @@ message Admin {
   // Indicates whether :ref:`global_downstream_max_connections <config_overload_manager_limiting_connections>`
   // should apply to the admin interface or not.
   bool ignore_global_conn_limit = 6;
+
+  // List of admin paths that are accessible. If not specified, all admin endpoints are accessible.
+  //
+  // When specified, only paths in this list will be accessible, all others will return 403 Forbidden.
+  //
+  // Example:
+  //
+  // .. code-block:: yaml
+  //
+  //   allow_paths:
+  //   - exact: /stats
+  //   - exact: /ready
+  //   - prefix: /healthcheck
+  //
+  repeated type.matcher.v3.StringMatcher allow_paths = 7;
 }
 
 // Cluster manager :ref:`architecture overview <arch_overview_cluster_manager>`.

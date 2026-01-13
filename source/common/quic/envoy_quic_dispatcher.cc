@@ -30,16 +30,15 @@ EnvoyQuicTimeWaitListManager::EnvoyQuicTimeWaitListManager(quic::QuicPacketWrite
                                                            QuicDispatcherStats& stats)
     : quic::QuicTimeWaitListManager(writer, visitor, clock, alarm_factory), stats_(stats) {}
 
-void EnvoyQuicTimeWaitListManager::SendPublicReset(
-    const quic::QuicSocketAddress& self_address, const quic::QuicSocketAddress& peer_address,
-    quic::QuicConnectionId connection_id, bool ietf_quic, size_t received_packet_length,
-    std::unique_ptr<quic::QuicPerPacketContext> packet_context) {
+void EnvoyQuicTimeWaitListManager::SendPublicReset(const quic::QuicSocketAddress& self_address,
+                                                   const quic::QuicSocketAddress& peer_address,
+                                                   quic::QuicConnectionId connection_id,
+                                                   bool ietf_quic, size_t received_packet_length) {
   ENVOY_LOG_EVERY_POW_2_MISC(info, "Sending Stateless Reset on connection {}",
                              connection_id.ToString());
   stats_.stateless_reset_packets_sent_.inc();
   quic::QuicTimeWaitListManager::SendPublicReset(self_address, peer_address, connection_id,
-                                                 ietf_quic, received_packet_length,
-                                                 std::move(packet_context));
+                                                 ietf_quic, received_packet_length);
 }
 
 EnvoyQuicDispatcher::EnvoyQuicDispatcher(
@@ -94,6 +93,7 @@ std::unique_ptr<quic::QuicSession> EnvoyQuicDispatcher::CreateQuicSession(
   // ALPN.
   Network::ConnectionSocketPtr connection_socket = createServerConnectionSocket(
       listen_socket_.ioHandle(), self_address, peer_address, std::string(parsed_chlo.sni), "h3");
+  connection_socket->connectionInfoProvider().setListenerInfo(listener_config_->listenerInfo());
   auto stream_info = std::make_unique<StreamInfo::StreamInfoImpl>(
       dispatcher_.timeSource(), connection_socket->connectionInfoProviderSharedPtr(),
       StreamInfo::FilterState::LifeSpan::Connection);
@@ -124,8 +124,8 @@ std::unique_ptr<quic::QuicSession> EnvoyQuicDispatcher::CreateQuicSession(
 
   auto quic_connection = std::make_unique<EnvoyQuicServerConnection>(
       server_connection_id, self_address, peer_address, *helper(), *alarm_factory(), writer(),
-      /*owns_writer=*/false, quic::ParsedQuicVersionVector{version}, std::move(connection_socket),
-      connection_id_generator, std::move(listener_filter_manager));
+      quic::ParsedQuicVersionVector{version}, std::move(connection_socket), connection_id_generator,
+      std::move(listener_filter_manager));
   auto quic_session = std::make_unique<EnvoyQuicServerSession>(
       quic_config, quic::ParsedQuicVersionVector{version}, std::move(quic_connection), this,
       session_helper(), crypto_config(), compressed_certs_cache(), dispatcher_,

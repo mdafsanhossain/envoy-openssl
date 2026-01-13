@@ -20,9 +20,10 @@
 #include "test/mocks/init/mocks.h"
 #include "test/mocks/protobuf/mocks.h"
 #include "test/mocks/secret/mocks.h"
-#include "test/mocks/server/transport_socket_factory_context.h"
+#include "test/mocks/server/server_factory_context.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/logging.h"
+#include "test/test_common/test_runtime.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
@@ -76,9 +77,37 @@ TEST_F(SdsApiTest, BasicTest) {
   setupMocks();
   TlsCertificateSdsApi sds_api(
       config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
-      []() {}, *dispatcher_, *api_);
+      []() {}, *dispatcher_, *api_, true);
   init_manager_.add(*sds_api.initTarget());
   initialize();
+}
+
+// Validate that target initializes when no warming is requested.
+TEST_F(SdsApiTest, BasicNoWarmTest) {
+  ::testing::InSequence s;
+  const envoy::service::secret::v3::SdsDummy dummy;
+
+  envoy::config::core::v3::ConfigSource config_source;
+  setupMocks();
+  TlsCertificateSdsApi sds_api(
+      config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
+      []() {}, *dispatcher_, *api_, false);
+  init_manager_.add(*sds_api.initTarget());
+  init_watcher_.expectReady();
+  initialize();
+}
+
+// Validate that start() initializes the target.
+TEST_F(SdsApiTest, BasicManualStart) {
+  ::testing::InSequence s;
+  const envoy::service::secret::v3::SdsDummy dummy;
+
+  envoy::config::core::v3::ConfigSource config_source;
+  TlsCertificateSdsApi sds_api(
+      config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
+      []() {}, *dispatcher_, *api_, false);
+  EXPECT_CALL(*subscription_factory_.subscription_, start(_));
+  sds_api.start();
 }
 
 // Validate that a noop init manager is used if the InitManger passed into the constructor
@@ -128,7 +157,7 @@ TEST_F(SdsApiTest, InitManagerInitialised) {
   EXPECT_EQ(Init::Manager::State::Initializing, init_manager.state());
   TlsCertificateSdsApi sds_api(
       config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
-      []() {}, *dispatcher_, *api_);
+      []() {}, *dispatcher_, *api_, true);
   EXPECT_NO_THROW(init_manager.add(*sds_api.initTarget()));
 }
 
@@ -144,7 +173,7 @@ TEST_F(SdsApiTest, BadConfigSource) {
       }));
   EXPECT_THROW_WITH_MESSAGE(TlsCertificateSdsApi(
                                 config_source, "abc.com", subscription_factory_, time_system_,
-                                validation_visitor_, stats_, []() {}, *dispatcher_, *api_),
+                                validation_visitor_, stats_, []() {}, *dispatcher_, *api_, true),
                             EnvoyException, "bad config");
 }
 
@@ -155,7 +184,7 @@ TEST_F(SdsApiTest, DynamicTlsCertificateUpdateSuccess) {
   setupMocks();
   TlsCertificateSdsApi sds_api(
       config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
-      []() {}, *dispatcher_, *api_);
+      []() {}, *dispatcher_, *api_, true);
   init_manager_.add(*sds_api.initTarget());
   initialize();
   NiceMock<Secret::MockSecretCallbacks> secret_callback;
@@ -179,14 +208,32 @@ TEST_F(SdsApiTest, DynamicTlsCertificateUpdateSuccess) {
   EXPECT_TRUE(subscription_factory_.callbacks_->onConfigUpdate(decoded_resources.refvec_, "").ok());
 
   testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext> ctx;
-  auto tls_config = Ssl::TlsCertificateConfigImpl::create(*sds_api.secret(), ctx, *api_).value();
+  Envoy::Ssl::TlsCertificateConfigImpl tls_config = std::move(
+      Ssl::TlsCertificateConfigImpl::create(*sds_api.secret(), ctx, *api_, "cert_name").value());
   const std::string cert_pem = "{{ test_rundir }}/test/common/tls/test_data/selfsigned_cert.pem";
   EXPECT_EQ(TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(cert_pem)),
-            tls_config->certificateChain());
+            tls_config.certificateChain());
 
   const std::string key_pem = "{{ test_rundir }}/test/common/tls/test_data/selfsigned_key.pem";
   EXPECT_EQ(TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(key_pem)),
-            tls_config->privateKey());
+            tls_config.privateKey());
+}
+
+TEST_F(SdsApiTest, CertificateRemoval) {
+  envoy::config::core::v3::ConfigSource config_source;
+  setupMocks();
+  TlsCertificateSdsApi sds_api(
+      config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
+      []() {}, *dispatcher_, *api_, true);
+  init_manager_.add(*sds_api.initTarget());
+  initialize();
+  NiceMock<Secret::MockSecretCallbacks> secret_callback;
+  auto handle = sds_api.addRemoveCallback(
+      [&secret_callback]() { return secret_callback.onAddOrUpdateSecret(); });
+  EXPECT_CALL(secret_callback, onAddOrUpdateSecret());
+  Protobuf::RepeatedPtrField<std::string> removals;
+  *removals.Add() = "abc.com";
+  EXPECT_TRUE(subscription_factory_.callbacks_->onConfigUpdate({}, removals, "").ok());
 }
 
 class SdsRotationApiTest : public SdsApiTestBase {
@@ -217,7 +264,7 @@ protected:
     envoy::config::core::v3::ConfigSource config_source;
     sds_api_ = std::make_unique<TlsCertificateSdsApi>(
         config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
-        []() {}, mock_dispatcher_, *api_);
+        []() {}, mock_dispatcher_, *api_, true);
     init_manager_.add(*sds_api_->initTarget());
     initialize();
     handle_ =
@@ -289,7 +336,7 @@ protected:
     envoy::config::core::v3::ConfigSource config_source;
     sds_api_ = std::make_unique<CertificateValidationContextSdsApi>(
         config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
-        []() {}, mock_dispatcher_, *api_);
+        []() {}, mock_dispatcher_, *api_, true);
     init_manager_.add(*sds_api_->initTarget());
     initialize();
     handle_ =
@@ -516,7 +563,7 @@ public:
                  Event::Dispatcher& dispatcher, Api::Api& api)
       : SdsApi(
             config_source, "abc.com", subscription_factory, time_source, validation_visitor_, stats,
-            []() {}, dispatcher, api) {
+            []() {}, dispatcher, api, true) {
     init_manager.add(init_target_);
   }
 
@@ -574,7 +621,7 @@ TEST_F(SdsApiTest, DeltaUpdateSuccess) {
   setupMocks();
   TlsCertificateSdsApi sds_api(
       config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
-      []() {}, *dispatcher_, *api_);
+      []() {}, *dispatcher_, *api_, true);
   init_manager_.add(*sds_api.initTarget());
 
   NiceMock<Secret::MockSecretCallbacks> secret_callback;
@@ -600,14 +647,15 @@ TEST_F(SdsApiTest, DeltaUpdateSuccess) {
       subscription_factory_.callbacks_->onConfigUpdate(decoded_resources.refvec_, {}, "").ok());
 
   testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext> ctx;
-  auto tls_config = Ssl::TlsCertificateConfigImpl::create(*sds_api.secret(), ctx, *api_).value();
+  Envoy::Ssl::TlsCertificateConfigImpl tls_config = std::move(
+      Ssl::TlsCertificateConfigImpl::create(*sds_api.secret(), ctx, *api_, "cert_name").value());
   const std::string cert_pem = "{{ test_rundir }}/test/common/tls/test_data/selfsigned_cert.pem";
   EXPECT_EQ(TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(cert_pem)),
-            tls_config->certificateChain());
+            tls_config.certificateChain());
 
   const std::string key_pem = "{{ test_rundir }}/test/common/tls/test_data/selfsigned_key.pem";
   EXPECT_EQ(TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(key_pem)),
-            tls_config->privateKey());
+            tls_config.privateKey());
 }
 
 // Validate that CertificateValidationContextSdsApi updates secrets successfully if
@@ -617,7 +665,7 @@ TEST_F(SdsApiTest, DynamicCertificateValidationContextUpdateSuccess) {
   setupMocks();
   CertificateValidationContextSdsApi sds_api(
       config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
-      []() {}, *dispatcher_, *api_);
+      []() {}, *dispatcher_, *api_, true);
   init_manager_.add(*sds_api.initTarget());
 
   NiceMock<Secret::MockSecretCallbacks> secret_callback;
@@ -639,11 +687,74 @@ TEST_F(SdsApiTest, DynamicCertificateValidationContextUpdateSuccess) {
   initialize();
   EXPECT_TRUE(subscription_factory_.callbacks_->onConfigUpdate(decoded_resources.refvec_, "").ok());
 
-  auto cvc_config =
-      Ssl::CertificateValidationContextConfigImpl::create(*sds_api.secret(), false, *api_).value();
+  auto cvc_config = Ssl::CertificateValidationContextConfigImpl::create(*sds_api.secret(), false,
+                                                                        *api_, "ca_cert_name")
+                        .value();
   const std::string ca_cert = "{{ test_rundir }}/test/common/tls/test_data/ca_cert.pem";
   EXPECT_EQ(TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(ca_cert)),
             cvc_config->caCert());
+}
+
+// Validate that CertificateValidationContextSdsApi does not add an empty trusted_ca
+// if it was not present in the original config.
+TEST_F(SdsApiTest, CertificateValidationContextNoTrustedCa) {
+  envoy::config::core::v3::ConfigSource config_source;
+  setupMocks();
+  CertificateValidationContextSdsApi sds_api(
+      config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
+      []() {}, *dispatcher_, *api_, true);
+  init_manager_.add(*sds_api.initTarget());
+
+  NiceMock<Secret::MockSecretCallbacks> secret_callback;
+  auto handle = sds_api.addUpdateCallback(
+      [&secret_callback]() { return secret_callback.onAddOrUpdateSecret(); });
+
+  std::string yaml =
+      R"EOF(
+  name: "abc.com"
+  validation_context:
+    allow_expired_certificate: true
+  )EOF";
+
+  envoy::extensions::transport_sockets::tls::v3::Secret typed_secret;
+  TestUtility::loadFromYaml(yaml, typed_secret);
+  const auto decoded_resources = TestUtility::decodeResources({typed_secret});
+  EXPECT_CALL(secret_callback, onAddOrUpdateSecret());
+  initialize();
+  EXPECT_TRUE(subscription_factory_.callbacks_->onConfigUpdate(decoded_resources.refvec_, "").ok());
+
+  EXPECT_FALSE(sds_api.secret()->has_trusted_ca());
+}
+
+TEST_F(SdsApiTest, CertificateValidationContextNoTrustedCa_NoRejectEmptyTrustedCa) {
+  Envoy::TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.reject_empty_trusted_ca_file", "false"}});
+  envoy::config::core::v3::ConfigSource config_source;
+  setupMocks();
+  CertificateValidationContextSdsApi sds_api(
+      config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
+      []() {}, *dispatcher_, *api_, true);
+  init_manager_.add(*sds_api.initTarget());
+
+  NiceMock<Secret::MockSecretCallbacks> secret_callback;
+  auto handle = sds_api.addUpdateCallback(
+      [&secret_callback]() { return secret_callback.onAddOrUpdateSecret(); });
+
+  std::string yaml =
+      R"EOF(
+  name: "abc.com"
+  validation_context:
+    allow_expired_certificate: true
+  )EOF";
+
+  envoy::extensions::transport_sockets::tls::v3::Secret typed_secret;
+  TestUtility::loadFromYaml(yaml, typed_secret);
+  const auto decoded_resources = TestUtility::decodeResources({typed_secret});
+  EXPECT_CALL(secret_callback, onAddOrUpdateSecret());
+  initialize();
+  EXPECT_TRUE(subscription_factory_.callbacks_->onConfigUpdate(decoded_resources.refvec_, "").ok());
+
+  EXPECT_FALSE(sds_api.secret()->has_trusted_ca());
 }
 
 class CvcValidationCallback {
@@ -669,7 +780,7 @@ TEST_F(SdsApiTest, DefaultCertificateValidationContextTest) {
   setupMocks();
   CertificateValidationContextSdsApi sds_api(
       config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
-      []() {}, *dispatcher_, *api_);
+      []() {}, *dispatcher_, *api_, true);
   init_manager_.add(*sds_api.initTarget());
 
   NiceMock<Secret::MockSecretCallbacks> secret_callback;
@@ -717,7 +828,8 @@ TEST_F(SdsApiTest, DefaultCertificateValidationContextTest) {
       default_cvc;
   merged_cvc.MergeFrom(*sds_api.secret());
   auto cvc_config =
-      Ssl::CertificateValidationContextConfigImpl::create(merged_cvc, false, *api_).value();
+      Ssl::CertificateValidationContextConfigImpl::create(merged_cvc, false, *api_, "ca_cert_name")
+          .value();
   // Verify that merging CertificateValidationContext applies logical OR to bool
   // field.
   EXPECT_TRUE(cvc_config->allowExpiredCertificate());
@@ -765,7 +877,7 @@ TEST_F(SdsApiTest, GenericSecretSdsApiTest) {
   setupMocks();
   GenericSecretSdsApi sds_api(
       config_source, "encryption_key", subscription_factory_, time_system_, validation_visitor_,
-      stats_, []() {}, *dispatcher_, *api_);
+      stats_, []() {}, *dispatcher_, *api_, true);
   init_manager_.add(*sds_api.initTarget());
 
   NiceMock<Secret::MockSecretCallbacks> secret_callback;
@@ -807,7 +919,7 @@ TEST_F(SdsApiTest, EmptyResource) {
   setupMocks();
   TlsCertificateSdsApi sds_api(
       config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
-      []() {}, *dispatcher_, *api_);
+      []() {}, *dispatcher_, *api_, true);
   init_manager_.add(*sds_api.initTarget());
 
   initialize();
@@ -821,7 +933,7 @@ TEST_F(SdsApiTest, SecretUpdateWrongSize) {
   setupMocks();
   TlsCertificateSdsApi sds_api(
       config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
-      []() {}, *dispatcher_, *api_);
+      []() {}, *dispatcher_, *api_, true);
   init_manager_.add(*sds_api.initTarget());
 
   std::string yaml =
@@ -857,7 +969,7 @@ TEST_F(SdsApiTest, SecretUpdateWrongSecretName) {
   setupMocks();
   TlsCertificateSdsApi sds_api(
       config_source, "abc.com", subscription_factory_, time_system_, validation_visitor_, stats_,
-      []() {}, *dispatcher_, *api_);
+      []() {}, *dispatcher_, *api_, true);
   init_manager_.add(*sds_api.initTarget());
 
   std::string yaml =

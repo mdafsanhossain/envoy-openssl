@@ -22,7 +22,12 @@ genrule(
     name = "generate_api_version_number",
     srcs = ["//:API_VERSION.txt"],
     outs = ["api_version_number.h"],
-    cmd = """./$(location //tools/api_versioning:generate_api_version_header_bin) $< >$@""",
+    cmd = """
+    PYPATH=$$(realpath $$(dirname $(PYTHON3)))
+    export PATH=$$PYPATH:$$PATH
+    ./$(location //tools/api_versioning:generate_api_version_header_bin) $< >$@
+    """,
+    toolchains = ["@rules_python//python:current_py_toolchain"],
     tools = ["//tools/api_versioning:generate_api_version_header_bin"],
     visibility = ["//visibility:private"],
 )
@@ -59,10 +64,7 @@ envoy_cc_library(
     name = "version_lib",
     srcs = ["version.cc"],
     copts = envoy_select_boringssl(
-        [
-            "-DENVOY_SSL_VERSION=\\\"BoringSSL-FIPS\\\"",
-            "-DENVOY_SSL_FIPS",
-        ],
+        ["-DENVOY_SSL_VERSION=\\\"BoringSSL-FIPS\\\""],
         ["-DENVOY_SSL_VERSION=\\\"BoringSSL\\\""],
     ),
     external_deps = ["ssl"],

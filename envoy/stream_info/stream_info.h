@@ -27,6 +27,8 @@ namespace Envoy {
 namespace Router {
 class Route;
 using RouteConstSharedPtr = std::shared_ptr<const Route>;
+class VirtualHost;
+using VirtualHostConstSharedPtr = std::shared_ptr<const VirtualHost>;
 } // namespace Router
 
 namespace Upstream {
@@ -246,6 +248,8 @@ struct ResponseCodeDetailValues {
   const std::string FilterAddedInvalidRequestData = "filter_added_invalid_request_data";
   // A filter called addDecodedData at the wrong point in the filter chain.
   const std::string FilterAddedInvalidResponseData = "filter_added_invalid_response_data";
+  // Data was received for a CONNECT request before 200 response headers were sent.
+  const std::string EarlyConnectData = "early_connect_data";
   // Changes or additions to details should be reflected in
   // docs/root/configuration/http/http_conn_man/response_code_details.rst
 };
@@ -327,6 +331,14 @@ struct UpstreamTiming {
     last_upstream_rx_byte_received_ = time_source.monotonicTime();
   }
 
+  /**
+   * Sets the time when the first byte of the response body is received from upstream.
+   */
+  void onFirstUpstreamRxBodyByteReceived(TimeSource& time_source) {
+    ASSERT(!first_upstream_rx_body_byte_received_);
+    first_upstream_rx_body_byte_received_ = time_source.monotonicTime();
+  }
+
   void onUpstreamConnectStart(TimeSource& time_source) {
     ASSERT(!upstream_connect_start_);
     upstream_connect_start_ = time_source.monotonicTime();
@@ -353,6 +365,7 @@ struct UpstreamTiming {
   absl::optional<MonotonicTime> last_upstream_tx_byte_sent_;
   absl::optional<MonotonicTime> first_upstream_rx_byte_received_;
   absl::optional<MonotonicTime> last_upstream_rx_byte_received_;
+  absl::optional<MonotonicTime> first_upstream_rx_body_byte_received_;
 
   absl::optional<MonotonicTime> upstream_connect_start_;
   absl::optional<MonotonicTime> upstream_connect_complete_;
@@ -436,9 +449,17 @@ struct BytesMeter {
   uint64_t wireBytesReceived() const { return wire_bytes_received_; }
   uint64_t headerBytesSent() const { return header_bytes_sent_; }
   uint64_t headerBytesReceived() const { return header_bytes_received_; }
+  uint64_t decompressedHeaderBytesSent() const { return decompressed_header_bytes_sent_; }
+  uint64_t decompressedHeaderBytesReceived() const { return decompressed_header_bytes_received_; }
 
   void addHeaderBytesSent(uint64_t added_bytes) { header_bytes_sent_ += added_bytes; }
   void addHeaderBytesReceived(uint64_t added_bytes) { header_bytes_received_ += added_bytes; }
+  void addDecompressedHeaderBytesSent(uint64_t added_bytes) {
+    decompressed_header_bytes_sent_ += added_bytes;
+  }
+  void addDecompressedHeaderBytesReceived(uint64_t added_bytes) {
+    decompressed_header_bytes_received_ += added_bytes;
+  }
   void addWireBytesSent(uint64_t added_bytes) { wire_bytes_sent_ += added_bytes; }
   void addWireBytesReceived(uint64_t added_bytes) { wire_bytes_received_ += added_bytes; }
 
@@ -446,6 +467,8 @@ struct BytesMeter {
     SystemTime snapshot_time;
     uint64_t header_bytes_sent{};
     uint64_t header_bytes_received{};
+    uint64_t decompressed_header_bytes_sent{};
+    uint64_t decompressed_header_bytes_received{};
     uint64_t wire_bytes_sent{};
     uint64_t wire_bytes_received{};
   };
@@ -455,6 +478,10 @@ struct BytesMeter {
     downstream_periodic_logging_bytes_snapshot_->snapshot_time = snapshot_time;
     downstream_periodic_logging_bytes_snapshot_->header_bytes_sent = header_bytes_sent_;
     downstream_periodic_logging_bytes_snapshot_->header_bytes_received = header_bytes_received_;
+    downstream_periodic_logging_bytes_snapshot_->decompressed_header_bytes_sent =
+        decompressed_header_bytes_sent_;
+    downstream_periodic_logging_bytes_snapshot_->decompressed_header_bytes_received =
+        decompressed_header_bytes_received_;
     downstream_periodic_logging_bytes_snapshot_->wire_bytes_sent = wire_bytes_sent_;
     downstream_periodic_logging_bytes_snapshot_->wire_bytes_received = wire_bytes_received_;
   }
@@ -464,6 +491,10 @@ struct BytesMeter {
     upstream_periodic_logging_bytes_snapshot_->snapshot_time = snapshot_time;
     upstream_periodic_logging_bytes_snapshot_->header_bytes_sent = header_bytes_sent_;
     upstream_periodic_logging_bytes_snapshot_->header_bytes_received = header_bytes_received_;
+    upstream_periodic_logging_bytes_snapshot_->decompressed_header_bytes_sent =
+        decompressed_header_bytes_sent_;
+    upstream_periodic_logging_bytes_snapshot_->decompressed_header_bytes_received =
+        decompressed_header_bytes_received_;
     upstream_periodic_logging_bytes_snapshot_->wire_bytes_sent = wire_bytes_sent_;
     upstream_periodic_logging_bytes_snapshot_->wire_bytes_received = wire_bytes_received_;
   }
@@ -491,6 +522,8 @@ struct BytesMeter {
     // Accumulate existing bytes.
     header_bytes_sent_ += existing.header_bytes_sent_;
     header_bytes_received_ += existing.header_bytes_received_;
+    decompressed_header_bytes_sent_ += existing.decompressed_header_bytes_sent_;
+    decompressed_header_bytes_received_ += existing.decompressed_header_bytes_received_;
     wire_bytes_sent_ += existing.wire_bytes_sent_;
     wire_bytes_received_ += existing.wire_bytes_received_;
   }
@@ -498,6 +531,8 @@ struct BytesMeter {
 private:
   uint64_t header_bytes_sent_{};
   uint64_t header_bytes_received_{};
+  uint64_t decompressed_header_bytes_sent_{};
+  uint64_t decompressed_header_bytes_received_{};
   uint64_t wire_bytes_sent_{};
   uint64_t wire_bytes_received_{};
   std::unique_ptr<BytesSnapshot> downstream_periodic_logging_bytes_snapshot_;
@@ -656,6 +691,15 @@ public:
   virtual void
   setConnectionTerminationDetails(absl::string_view connection_termination_details) PURE;
 
+  /*
+   * @param short string type flag to indicate the noteworthy event of this stream. Mutliple flags
+   * could be added and will be concatenated with comma. It should not contain any empty or space
+   * characters (' ', '\t', '\f', '\v', '\n', '\r').
+   *
+   * The short string should not duplicate with the any registered response flags.
+   */
+  virtual void addCustomFlag(absl::string_view) PURE;
+
   /**
    * @return std::string& the name of the route. The name is get from the route() and it is
    *         empty if there is no route.
@@ -809,6 +853,11 @@ public:
   virtual uint64_t legacyResponseFlags() const PURE;
 
   /**
+   * @return all stream flags that are added.
+   */
+  virtual absl::string_view customFlags() const PURE;
+
+  /**
    * @return whether the request is a health check request or not.
    */
   virtual bool healthCheck() const PURE;
@@ -829,6 +878,12 @@ public:
   virtual Router::RouteConstSharedPtr route() const PURE;
 
   /**
+   * @return const Router::VirtualHostConstSharedPtr& Get the virtual host selected for this
+   * request.
+   */
+  virtual const Router::VirtualHostConstSharedPtr& virtualHost() const PURE;
+
+  /**
    * @return const envoy::config::core::v3::Metadata& the dynamic metadata associated with this
    * request
    */
@@ -841,14 +896,14 @@ public:
    * @param value the struct to set on the namespace. A merge will be performed with new values for
    * the same key overriding existing.
    */
-  virtual void setDynamicMetadata(const std::string& name, const ProtobufWkt::Struct& value) PURE;
+  virtual void setDynamicMetadata(const std::string& name, const Protobuf::Struct& value) PURE;
 
   /**
    * @param name the namespace used in the metadata in reverse DNS format, for example:
    * envoy.test.my_filter.
    * @param value of type protobuf any to set on the namespace.
    */
-  virtual void setDynamicTypedMetadata(const std::string& name, const ProtobufWkt::Any& value) PURE;
+  virtual void setDynamicTypedMetadata(const std::string& name, const Protobuf::Any& value) PURE;
 
   /**
    * Object on which filters can share data on a per-request basis. For singleton data objects, only

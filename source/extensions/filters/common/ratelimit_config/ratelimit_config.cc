@@ -104,15 +104,10 @@ RateLimitPolicy::RateLimitPolicy(const ProtoRateLimit& config,
       }
       auto message = Envoy::Config::Utility::translateAnyToFactoryConfig(
           action.extension().typed_config(), validator, *factory);
-      Envoy::RateLimit::DescriptorProducerPtr producer =
+      absl::StatusOr<Envoy::RateLimit::DescriptorProducerPtr> producer_or =
           factory->createDescriptorProducerFromProto(*message, context);
-      if (producer) {
-        actions_.emplace_back(std::move(producer));
-      } else {
-        creation_status = absl::InvalidArgumentError(
-            absl::StrCat("Rate limit descriptor extension failed: ", action.extension().name()));
-        return;
-      }
+      SET_AND_RETURN_IF_NOT_OK(producer_or.status(), creation_status);
+      actions_.emplace_back(std::move(producer_or.value()));
       break;
     }
     case ProtoRateLimit::Action::ActionSpecifierCase::kMaskedRemoteAddress:
@@ -147,8 +142,8 @@ void RateLimitPolicy::populateDescriptors(const Http::RequestHeaderMap& headers,
 
   // Populate hits_addend if set.
   if (hits_addend_provider_ != nullptr) {
-    const ProtobufWkt::Value hits_addend_value =
-        hits_addend_provider_->formatValueWithContext({&headers}, stream_info);
+    const Protobuf::Value hits_addend_value =
+        hits_addend_provider_->formatValue({&headers}, stream_info);
 
     double hits_addend = 0;
     bool success = true;
